@@ -1,0 +1,51 @@
+voter_id,name,department,role
+V001,Ishita Sharma,Human Resources,Engineering Lead
+V002,Rahul Mehta,Product,Research Scientist
+V003,Ananya Deshmukh,Research,Software Engineer
+V004,Diya Verma,Finance,Engineering Lead
+V005,Diya Das,Finance,Research Scientist
+V006,Gaurav Sen,Marketing,Staff Engineer
+V007,Pooja Sharma,Operations,HR Specialist
+V008,Rhea Reddy,Operations,Engineering Lead
+V009,Rhea Singh,Product,HR Specialist
+V010,Vihaan Kapoor,Legal,Staff Engineer
+V011,Nikhil Patel,Marketing,Research Scientist
+V012,Ishita Chopra,Product,Research Scientist
+V013,Siddharth Bose,Legal,Staff Engineer
+V014,Dev Agarwal,Product,Software Engineer
+V015,Rahul Joshi,Product,Engineering Lead
+V016,Vihaan Chopra,Human Resources,Legal Counsel
+V017,Tara Rao,Legal,Financial Analyst
+V018,Kavya Ghosh,Human Resources,Senior Software Engineer
+V019,Aditya Das,Finance,Product Manager
+V020,Anushka Chopra,Human Resources,Research Scientist
+V021,Rahul Ghosh,Legal,Software Engineer
+V022,Rahul Patel,Legal,HR Specialist
+V023,Pooja Verma,Finance,Staff Engineer
+V024,Varun Gupta,Marketing,HR Specialist
+V025,Anushka Mehta,Human Resources,Product Manager
+V026,Tanvi Pillai,Human Resources,Staff Engineer
+V027,Simran Deshmukh,Research,Financial Analyst
+V028,Rahul Mehta,Marketing,Senior Software Engineer
+V029,Priya Singh,Operations,Product Manager
+V030,Simran Menon,Product,HR Specialist
+V031,Karan Menon,Marketing,Research Scientist
+V032,Nikhil Das,Engineering,Senior Software Engineer
+V033,Pooja Bose,Legal,Senior Software Engineer
+V034,Siddharth Nair,Operations,Legal Counsel
+V035,Aarav Pillai,Human Resources,Research Scientist
+V036,Sanya Saxena,Product,Operations Analyst
+V037,Dev Mehta,Legal,Product Manager
+V038,Aarav Menon,Legal,Legal Counsel
+V039,Diya Singh,Legal,Operations Analyst
+V040,Tanvi Patel,Finance,Staff Engineer
+V041,Ananya Verma,Marketing,Senior Software Engineer
+V042,Arjun Mehta,Marketing,Research Scientist
+V043,Aditya Reddy,Research,Engineering Lead
+V044,Dev Agarwal,Human Resources,HR Specialist
+V045,Tara Bhat,Marketing,Senior Software Engineer
+V046,Tanvi Sen,Product,Financial Analyst
+V047,Diya Deshmukh,Finance,Staff Engineer
+V048,Rahul Sharma,Product,Software Engineer
+V049,Rahul Verma,Engineering,Financial Analyst
+V050,Kabir Saxena,Finance,Operations Analyst
