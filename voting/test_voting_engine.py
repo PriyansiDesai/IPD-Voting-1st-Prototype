@@ -25,6 +25,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from unittest.mock import patch
+
 from voting.voting_engine import (
     VotingEngine,
     VotingError,
@@ -35,6 +37,7 @@ from voting.voting_engine import (
     UnknownCandidateError,
     CandidateNotAssignedError,
     DuplicateVoteError,
+    BB84SecurityError,
 )
 
 
@@ -241,6 +244,97 @@ class TestVotingEngineM3(unittest.TestCase):
         self.assertEqual(tally["C002"], 2)
         self.assertEqual(tally["C007"], 1)
         self.assertEqual(tally["C011"], 1)
+
+    @patch("voting.voting_engine.encrypt_vote")
+    @patch("voting.voting_engine.run_secure_bb84")
+    def test_bb84_failure_prevents_encryption_and_blockchain(self, mock_run_bb84, mock_encrypt):
+        """M4 Test: Insecure BB84 session (aborted/high QBER) halts pipeline before encryption or ledger."""
+        mock_run_bb84.return_value = {
+            "secure": False,
+            "aborted": True,
+            "qber": 0.28,
+            "sample_size": 16,
+            "error_count": 5,
+            "qber_threshold": 0.11,
+            "sifted_key_length": 32,
+            "final_key": None,
+            "eavesdrop": True,
+            "reason": "qber_threshold_exceeded",
+        }
+
+        chain = self.engine.get_session_chain("SESS-003")
+        initial_block_count = len(chain.chain)  # 1 (genesis)
+
+        with self.assertRaises(BB84SecurityError) as ctx:
+            self.engine.cast_vote(
+                session_id="SESS-003",
+                voter_id="V001",
+                candidate_id="C002",
+            )
+
+        self.assertIn("BB84 security check failed", str(ctx.exception))
+        self.assertIn("qber_threshold_exceeded", str(ctx.exception))
+
+        # 1. encrypt_vote was NEVER called
+        mock_encrypt.assert_not_called()
+
+        # 2. Blockchain has not been modified
+        self.assertEqual(len(chain.chain), initial_block_count)
+        self.assertEqual(chain.get_vote_count(), 0)
+        self.assertFalse(chain.has_voter_voted("V001"))
+
+        # 3. Voter has not been recorded as voted
+        self.assertNotIn(("SESS-003", "V001"), self.engine._voted_voters)
+        self.assertEqual(len(self.engine._accepted_votes), 0)
+
+    @patch("voting.voting_engine.encrypt_vote")
+    @patch("voting.voting_engine.run_secure_bb84")
+    def test_bb84_insufficient_bits_halts_pipeline(self, mock_run_bb84, mock_encrypt):
+        """M4 Test: Insufficient sifted bits condition aborts vote before encryption or ledger."""
+        mock_run_bb84.return_value = {
+            "secure": False,
+            "aborted": True,
+            "qber": 0.0,
+            "sample_size": 0,
+            "error_count": 0,
+            "qber_threshold": 0.11,
+            "sifted_key_length": 4,
+            "final_key": None,
+            "eavesdrop": False,
+            "reason": "insufficient_sifted_bits",
+        }
+
+        chain = self.engine.get_session_chain("SESS-003")
+        with self.assertRaises(BB84SecurityError) as ctx:
+            self.engine.cast_vote("SESS-003", "V001", "C002")
+
+        self.assertIn("BB84 security check failed", str(ctx.exception))
+        self.assertIn("insufficient_sifted_bits", str(ctx.exception))
+        mock_encrypt.assert_not_called()
+        self.assertEqual(chain.get_vote_count(), 0)
+        self.assertFalse(chain.has_voter_voted("V001"))
+
+    def test_bb84_secure_vote_success_and_ledger_storage(self):
+        """M4 Test: Normal secure vote runs BB84, derives key, encrypts, and records on blockchain."""
+        result = self.engine.cast_vote(
+            session_id="SESS-003",
+            voter_id="V001",
+            candidate_id="C002",
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["voter_id"], "V001")
+        self.assertEqual(result["candidate_id"], "C002")
+
+        # Check blockchain ledger
+        chain = self.engine.get_session_chain("SESS-003")
+        self.assertEqual(chain.get_vote_count(), 1)
+        self.assertTrue(chain.has_voter_voted("V001"))
+        self.assertTrue(chain.is_chain_valid())
+
+        # Check keystore holds the final key and roundtrip decryption succeeds
+        ver = self.engine.verify_vote_on_blockchain("SESS-003", result["vote_id"])
+        self.assertTrue(ver["verified"])
+        self.assertEqual(ver["decrypted_candidate"], "C002")
 
 
 def run_all_tests():

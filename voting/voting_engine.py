@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from vol1_encoding import encode_vote
-from vol2_bb84 import get_secure_key
+from vol2_bb84 import run_secure_bb84
 from vol3_pqc import encrypt_vote, decrypt_vote
 from vol4_blockchain import Blockchain, Block
 
@@ -61,6 +61,11 @@ class CandidateNotAssignedError(VotingError):
 
 class DuplicateVoteError(VotingError):
     """Raised when a voter attempts to vote more than once in the same session."""
+    pass
+
+
+class BB84SecurityError(VotingError):
+    """Raised when BB84 quantum key distribution fails security checks or aborts."""
     pass
 
 
@@ -293,8 +298,13 @@ class VotingEngine:
         encoded_candidate = encoded_result["decoded_candidate"]
 
         # ── Step 3: BB84 Quantum Key Distribution (vol2) ───────────────────────
-        # Generate fresh BB84 key for every accepted vote
-        bb84_key = get_secure_key(min_length=8)
+        # Negotiate quantum key using secure BB84 protocol with security verification
+        bb84_result = run_secure_bb84(min_key_length=8)
+        if not bb84_result.get("secure", False) or bb84_result.get("aborted", True):
+            reason = bb84_result.get("reason", "unknown")
+            raise BB84SecurityError(f"BB84 security check failed: {reason}")
+
+        bb84_key = bb84_result["final_key"]
 
         # ── Step 4: Quantum-Safe Encryption (vol3) ─────────────────────────────
         # Encrypt the decoded candidate string and convert to hex for blockchain
