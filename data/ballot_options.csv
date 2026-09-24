@@ -1,0 +1,16 @@
+option_id,option_label,option_type
+O001,Yes,yes_no
+O002,No,yes_no
+O003,Abstain,yes_no
+O004,Project Alpha,project
+O005,Project Beta,project
+O006,Project Gamma,project
+O007,Project Delta,project
+O008,Project Epsilon,project
+O009,Project Zeta,project
+O010,Provider North,provider
+O011,Provider Central,provider
+O012,Provider South,provider
+O013,Provider East,provider
+O014,Provider West,provider
+O015,Provider Global,provider
