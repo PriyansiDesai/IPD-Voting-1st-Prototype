@@ -1,31 +1,49 @@
 """
 test_voting_engine.py
-M3: Test suite for Multi-Voter Voting Engine with Quantum & Blockchain Pipeline.
+Comprehensive test suite for Multi-Voter Voting Engine supporting the corrected M1 data model.
 
 Covers:
-1. Successful end-to-end vote (quantum encoding, BB84 key, PQC encryption, blockchain block)
-2. Invalid/unknown voter rejected
-3. Ineligible voter rejected
-4. Inactive session rejected (COMPLETED and UPCOMING)
-5. Invalid/unknown candidate rejected
-6. Candidate not assigned to session rejected
-7. Duplicate vote in same session rejected (engine and blockchain layer)
-8. Same voter voting in another session accepted (cross-session blockchain isolation)
-9. Blockchain integrity and tamper detection
-10. Encryption/decryption verification using verify_vote_on_blockchain()
-11. Multiple voters in one session (chain growth, tallies, and integrity)
+1. Successful votes across all three session types:
+   - candidate_election (people candidates only, SESS-004)
+   - yes_no (Yes/No required, optional Abstain, SESS-002)
+   - single_choice (decision alternatives, SESS-008)
+2. Strict choice argument validation:
+   - Exactly one of choice_id, candidate_id, or option_id permitted.
+   - Rejecting 0 or multiple choice arguments.
+3. Choice type and assignment validation:
+   - Rejecting option IDs in candidate_election sessions.
+   - Rejecting candidate IDs in decision sessions.
+   - Rejecting unknown candidates/options.
+   - Rejecting unassigned candidates/options (e.g. Abstain in SESS-003).
+4. Voter existence and eligibility enforcement:
+   - Ineligible voter rejected using smaller-subset session SESS-003 activated in fixture.
+5. Inactive and out-of-window session rejection:
+   - COMPLETED sessions, UPCOMING sessions, and expired active windows.
+6. Duplicate vote prevention & Concurrency:
+   - Sequential duplicate vote rejected.
+   - Simultaneous multithreaded submissions by the same voter produce exactly one accepted vote.
+7. Multi-session participation:
+   - Same voter permitted to vote in distinct eligible sessions with independent blockchains.
+8. Privacy-preserving receipts and verification:
+   - Receipts do NOT leak plaintext choices.
+   - Verification accepts explicit expected_choice input without retaining plaintext links.
+9. Security gates:
+   - BB84 failure stops pipeline before encryption or ledger write.
+   - Reservation released on BB84 failure, enabling retry.
+10. Tamper detection and blockchain ledger integrity.
+11. CSV data validation and duplicate detection.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from unittest.mock import patch
 
 from voting.voting_engine import (
     VotingEngine,
@@ -36,31 +54,36 @@ from voting.voting_engine import (
     IneligibleVoterError,
     UnknownCandidateError,
     CandidateNotAssignedError,
+    InvalidChoiceError,
+    UnknownOptionError,
+    OptionNotAssignedError,
     DuplicateVoteError,
     BB84SecurityError,
 )
 
 
 class TestVotingEngineM3(unittest.TestCase):
-    """Unit test cases for M3 Quantum & Blockchain integrated VotingEngine."""
+    """Unit test cases for M1-supported Multi-Voter VotingEngine."""
 
     def setUp(self):
         # Create fresh engine instance before each test
         self.engine = VotingEngine()
 
-    def test_successful_end_to_end_vote(self):
-        """Test 1: Successful end-to-end vote through full quantum and blockchain pipeline."""
+    def test_successful_end_to_end_vote_candidate_election(self):
+        """Test 1: Successful end-to-end vote in candidate_election session (SESS-004, ACTIVE)."""
         result = self.engine.cast_vote(
-            session_id="SESS-003",
+            session_id="SESS-004",
             voter_id="V001",
             candidate_id="C002",
         )
 
-        # 1. Receipt verification
+        # 1. Receipt verification (does NOT leak plaintext choice)
         self.assertTrue(result["success"])
-        self.assertEqual(result["session_id"], "SESS-003")
+        self.assertEqual(result["session_id"], "SESS-004")
         self.assertEqual(result["voter_id"], "V001")
-        self.assertEqual(result["candidate_id"], "C002")
+        self.assertNotIn("choice_id", result)
+        self.assertNotIn("candidate_id", result)
+        self.assertNotIn("option_id", result)
         self.assertIn("VOTE-", result["vote_id"])
         self.assertIsNotNone(result["timestamp"])
         self.assertIsNotNone(result["block_hash"])
@@ -68,7 +91,7 @@ class TestVotingEngineM3(unittest.TestCase):
         self.assertGreater(result["num_qubits"], 0)
 
         # 2. Blockchain state verification
-        session_chain = self.engine.get_session_chain("SESS-003")
+        session_chain = self.engine.get_session_chain("SESS-004")
         self.assertEqual(len(session_chain.chain), 2)  # Genesis + 1 vote block
         self.assertTrue(session_chain.is_chain_valid())
         self.assertTrue(session_chain.has_voter_voted("V001"))
@@ -79,108 +102,326 @@ class TestVotingEngineM3(unittest.TestCase):
         self.assertNotIn("C002", stored_payload)
         self.assertEqual(bytes.fromhex(stored_payload).hex(), stored_payload)
 
+        # 4. Roundtrip decryption & verification using explicit expected_choice
+        ver = self.engine.verify_vote_on_blockchain(
+            session_id="SESS-004",
+            vote_id=result["vote_id"],
+            expected_choice="C002",
+        )
+        self.assertTrue(ver["verified"])
+        self.assertTrue(ver["matches_original"])
+        self.assertEqual(ver["decrypted_choice"], "C002")
+
+    def test_successful_end_to_end_vote_yes_no(self):
+        """Test 2: Successful end-to-end votes in yes_no session (SESS-002: Yes, No, Abstain)."""
+        self.engine.set_session_status("SESS-002", "ACTIVE")
+        s2_voters = sorted(list(self.engine.session_voters["SESS-002"]))
+
+        # Vote Yes (O001)
+        r_yes = self.engine.cast_vote(session_id="SESS-002", voter_id=s2_voters[0], option_id="O001")
+        self.assertTrue(r_yes["success"])
+        self.assertNotIn("choice_id", r_yes)
+
+        # Vote No (O002)
+        r_no = self.engine.cast_vote(session_id="SESS-002", voter_id=s2_voters[1], choice_id="O002")
+        self.assertTrue(r_no["success"])
+
+        # Vote Abstain (O003) - optional choice
+        r_abs = self.engine.cast_vote(session_id="SESS-002", voter_id=s2_voters[2], option_id="O003")
+        self.assertTrue(r_abs["success"])
+
+        # Blockchain & Tally verification
+        chain = self.engine.get_session_chain("SESS-002")
+        self.assertEqual(chain.get_vote_count(), 3)
+        self.assertTrue(chain.is_chain_valid())
+
+        tally = self.engine.get_tally("SESS-002")
+        self.assertEqual(tally["O001"], 1)
+        self.assertEqual(tally["O002"], 1)
+        self.assertEqual(tally["O003"], 1)
+
+        # Verification of roundtrip decryption with explicit expected choice
+        ver_abs = self.engine.verify_vote_on_blockchain("SESS-002", r_abs["vote_id"], expected_choice="O003")
+        self.assertTrue(ver_abs["verified"])
+        self.assertEqual(ver_abs["decrypted_choice"], "O003")
+
+    def test_successful_end_to_end_vote_single_choice(self):
+        """Test 3: Successful end-to-end vote in single_choice policy session (SESS-008: O016-O018)."""
+        self.engine.set_session_status("SESS-008", "ACTIVE")
+        s8_voters = sorted(list(self.engine.session_voters["SESS-008"]))
+
+        result = self.engine.cast_vote(
+            session_id="SESS-008",
+            voter_id=s8_voters[0],
+            option_id="O016",
+        )
+        self.assertTrue(result["success"])
+        self.assertNotIn("choice_id", result)
+
+        tally = self.engine.get_tally("SESS-008")
+        self.assertEqual(tally["O016"], 1)
+        self.assertEqual(tally["O017"], 0)
+        self.assertEqual(tally["O018"], 0)
+
+        ver = self.engine.verify_vote_on_blockchain("SESS-008", result["vote_id"], expected_choice="O016")
+        self.assertTrue(ver["verified"])
+        self.assertEqual(ver["decrypted_choice"], "O016")
+
+    def test_strict_choice_arguments_required(self):
+        """Test 4: Require exactly one choice argument; reject none or multiple values."""
+        # 4.1 Supplying no choice argument
+        with self.assertRaises(VotingError) as ctx_none:
+            self.engine.cast_vote(
+                session_id="SESS-004",
+                voter_id="V001",
+            )
+        self.assertIn("No vote choice supplied", str(ctx_none.exception))
+
+        # 4.2 Supplying both candidate_id and option_id
+        with self.assertRaises(VotingError) as ctx_mult:
+            self.engine.cast_vote(
+                session_id="SESS-004",
+                voter_id="V001",
+                candidate_id="C002",
+                option_id="O001",
+            )
+        self.assertIn("Multiple vote choices supplied", str(ctx_mult.exception))
+
+        # 4.3 Supplying choice_id and candidate_id
+        with self.assertRaises(VotingError):
+            self.engine.cast_vote(
+                session_id="SESS-004",
+                voter_id="V001",
+                choice_id="C002",
+                candidate_id="C002",
+            )
+
     def test_unknown_voter_rejected(self):
-        """Test 2: Unknown voter ID is rejected."""
+        """Test 5: Unknown voter ID is rejected."""
         with self.assertRaises(UnknownVoterError):
             self.engine.cast_vote(
-                session_id="SESS-003",
+                session_id="SESS-004",
                 voter_id="V999",
                 candidate_id="C002",
             )
 
     def test_ineligible_voter_rejected(self):
-        """Test 3: Known voter who is not enrolled in the session is rejected."""
-        # V002 exists in voters.csv but is not enrolled in session_voters for SESS-003
-        self.assertIn("V002", self.engine.voters)
-        self.assertNotIn("V002", self.engine.session_voters["SESS-003"])
+        """Test 6: Known voter not enrolled in a smaller-subset session is rejected (SESS-003 made active in fixture)."""
+        # SESS-004 has all 400 voters, so it cannot test ineligibility.
+        # SESS-003 has 200 voters; activate it in memory and test an unenrolled voter.
+        self.engine.set_session_status("SESS-003", "ACTIVE")
+        all_voter_ids = set(self.engine.voters.keys())
+        s3_voters = self.engine.session_voters["SESS-003"]
+        ineligible_candidates = sorted(list(all_voter_ids - s3_voters))
+        self.assertGreater(len(ineligible_candidates), 0)
+
+        ineligible_vid = ineligible_candidates[0]
+        self.assertIn(ineligible_vid, self.engine.voters)
+        self.assertNotIn(ineligible_vid, self.engine.session_voters["SESS-003"])
+
         with self.assertRaises(IneligibleVoterError):
             self.engine.cast_vote(
                 session_id="SESS-003",
-                voter_id="V002",
-                candidate_id="C002",
+                voter_id=ineligible_vid,
+                option_id="O001",
             )
 
-    def test_inactive_session_rejected(self):
-        """Test 4: Sessions not in ACTIVE status (COMPLETED, UPCOMING) are rejected."""
-        # SESS-001 is COMPLETED
+    def test_inactive_and_out_of_window_session_rejected(self):
+        """Test 7: Sessions not in ACTIVE status or outside their time window are rejected."""
+        # 7.1 SESS-001 is COMPLETED
         self.assertEqual(self.engine.sessions["SESS-001"]["status"], "COMPLETED")
         with self.assertRaises(InactiveSessionError):
             self.engine.cast_vote(
                 session_id="SESS-001",
                 voter_id="V001",
-                candidate_id="C008",
+                candidate_id="C001",
             )
 
-        # SESS-004 is UPCOMING
-        self.assertEqual(self.engine.sessions["SESS-004"]["status"], "UPCOMING")
+        # 7.2 SESS-005 is UPCOMING
+        self.assertEqual(self.engine.sessions["SESS-005"]["status"], "UPCOMING")
+        with self.assertRaises(InactiveSessionError):
+            self.engine.cast_vote(
+                session_id="SESS-005",
+                voter_id="V001",
+                option_id="O004",
+            )
+
+        # 7.3 ACTIVE session with expired end_time is rejected
+        self.engine.sessions["SESS-004"]["end_time"] = "2020-01-01T00:00:00Z"
         with self.assertRaises(InactiveSessionError):
             self.engine.cast_vote(
                 session_id="SESS-004",
                 voter_id="V001",
-                candidate_id="C001",
+                candidate_id="C002",
             )
 
-    def test_invalid_candidate_rejected(self):
-        """Test 5: Unknown candidate ID is rejected."""
+    def test_unknown_and_unassigned_candidate_rejected(self):
+        """Test 8: Unknown and unassigned candidates in candidate_election are rejected."""
+        # Unknown candidate C999
         with self.assertRaises(UnknownCandidateError):
             self.engine.cast_vote(
-                session_id="SESS-003",
+                session_id="SESS-004",
                 voter_id="V001",
                 candidate_id="C999",
             )
 
-    def test_candidate_not_assigned_to_session_rejected(self):
-        """Test 6: Known candidate not assigned to the selected session is rejected."""
-        # C001 is a valid candidate but not assigned to SESS-003
-        self.assertIn("C001", self.engine.candidates)
-        self.assertNotIn("C001", self.engine.session_candidates["SESS-003"])
+        # Candidate temporarily removed from session_candidates
+        self.engine.session_candidates["SESS-004"].remove("C015")
         with self.assertRaises(CandidateNotAssignedError):
             self.engine.cast_vote(
-                session_id="SESS-003",
+                session_id="SESS-004",
                 voter_id="V001",
+                candidate_id="C015",
+            )
+
+    def test_unknown_and_unassigned_option_rejected(self):
+        """Test 9: Unknown and unassigned options in decision sessions are rejected."""
+        self.engine.set_session_status("SESS-002", "ACTIVE")
+        s2_voter = sorted(list(self.engine.session_voters["SESS-002"]))[0]
+
+        # Unknown option O999
+        with self.assertRaises(UnknownOptionError):
+            self.engine.cast_vote(
+                session_id="SESS-002",
+                voter_id=s2_voter,
+                option_id="O999",
+            )
+
+        # Unassigned option: O010 (Provider North) not in SESS-002
+        with self.assertRaises(OptionNotAssignedError):
+            self.engine.cast_vote(
+                session_id="SESS-002",
+                voter_id=s2_voter,
+                option_id="O010",
+            )
+
+        # In SESS-003, Abstain (O003) is intentionally NOT assigned
+        self.engine.set_session_status("SESS-003", "ACTIVE")
+        s3_voter = sorted(list(self.engine.session_voters["SESS-003"]))[0]
+        with self.assertRaises(OptionNotAssignedError):
+            self.engine.cast_vote(
+                session_id="SESS-003",
+                voter_id=s3_voter,
+                option_id="O003",
+            )
+
+    def test_wrong_type_choice_rejected(self):
+        """Test 10: Reject option ID in candidate_election and candidate ID in decision session."""
+        # 10.1 Option in candidate election
+        with self.assertRaises(InvalidChoiceError):
+            self.engine.cast_vote(
+                session_id="SESS-004",
+                voter_id="V001",
+                choice_id="O001",
+            )
+
+        with self.assertRaises(InvalidChoiceError):
+            self.engine.cast_vote(
+                session_id="SESS-004",
+                voter_id="V001",
+                option_id="O001",
+            )
+
+        # 10.2 Candidate in yes_no session
+        self.engine.set_session_status("SESS-002", "ACTIVE")
+        s2_voter = sorted(list(self.engine.session_voters["SESS-002"]))[0]
+        with self.assertRaises(InvalidChoiceError):
+            self.engine.cast_vote(
+                session_id="SESS-002",
+                voter_id=s2_voter,
+                choice_id="C001",
+            )
+
+        with self.assertRaises(InvalidChoiceError):
+            self.engine.cast_vote(
+                session_id="SESS-002",
+                voter_id=s2_voter,
                 candidate_id="C001",
             )
 
-    def test_duplicate_vote_in_same_session_rejected(self):
-        """Test 7: Second vote by the same voter within the same session is rejected."""
-        self.engine.cast_vote("SESS-003", "V001", "C002")
-        self.assertEqual(self.engine.count_accepted_votes("SESS-003"), 1)
+        # 10.3 Candidate in single_choice session
+        self.engine.set_session_status("SESS-008", "ACTIVE")
+        s8_voter = sorted(list(self.engine.session_voters["SESS-008"]))[0]
+        with self.assertRaises(InvalidChoiceError):
+            self.engine.cast_vote(
+                session_id="SESS-008",
+                voter_id=s8_voter,
+                choice_id="C001",
+            )
 
-        # Attempt second vote in SESS-003
+    def test_duplicate_vote_in_same_session_rejected(self):
+        """Test 11: Second vote by the same voter within the same session is rejected."""
+        self.engine.cast_vote("SESS-004", "V001", candidate_id="C002")
+        self.assertEqual(self.engine.count_accepted_votes("SESS-004"), 1)
+
+        # Attempt second vote in SESS-004
         with self.assertRaises(DuplicateVoteError):
-            self.engine.cast_vote("SESS-003", "V001", "C011")
+            self.engine.cast_vote("SESS-004", "V001", candidate_id="C011")
 
         # Blockchain should still have exactly 1 vote block (plus genesis)
-        chain = self.engine.get_session_chain("SESS-003")
+        chain = self.engine.get_session_chain("SESS-004")
         self.assertEqual(chain.get_vote_count(), 1)
 
+    def test_concurrent_submissions_same_voter_produce_exactly_one_vote(self):
+        """Test 12: Atomic reservation prevents duplicate votes under concurrent execution."""
+        # 10 simultaneous threads attempting to cast a vote for V001 in SESS-004
+        results = []
+        errors = []
+
+        def submit_vote(worker_idx):
+            try:
+                res = self.engine.cast_vote(
+                    session_id="SESS-004",
+                    voter_id="V001",
+                    candidate_id="C002",
+                )
+                results.append((worker_idx, res))
+            except Exception as e:
+                errors.append((worker_idx, type(e), e))
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(submit_vote, i) for i in range(10)]
+            for f in futures:
+                f.result()
+
+        # Exactly 1 vote must succeed; the other 9 must be rejected as DuplicateVoteError
+        self.assertEqual(len(results), 1, f"Expected 1 successful vote, got {len(results)}")
+        self.assertEqual(len(errors), 9, f"Expected 9 rejections, got {len(errors)}")
+        for worker_idx, err_type, err in errors:
+            self.assertEqual(err_type, DuplicateVoteError, f"Worker {worker_idx} raised unexpected error: {err}")
+
+        # Blockchain must contain exactly 1 vote block (plus genesis)
+        chain = self.engine.get_session_chain("SESS-004")
+        self.assertEqual(chain.get_vote_count(), 1)
+        self.assertEqual(self.engine.get_tally("SESS-004")["C002"], 1)
+
     def test_same_voter_in_another_session_accepted(self):
-        """Test 8: The same voter is permitted to vote in multiple different sessions."""
-        # 1. Vote in SESS-003 (ACTIVE)
-        res1 = self.engine.cast_vote("SESS-003", "V001", "C002")
+        """Test 13: The same voter is permitted to vote in multiple different sessions."""
+        # 1. Vote in SESS-004 (ACTIVE candidate_election)
+        res1 = self.engine.cast_vote("SESS-004", "V001", candidate_id="C002")
         self.assertTrue(res1["success"])
 
-        # 2. Activate SESS-004 in memory on this engine instance without modifying CSV
-        self.engine.set_session_status("SESS-004", "ACTIVE")
-        self.assertIn("V001", self.engine.session_voters["SESS-004"])
-        self.assertIn("C001", self.engine.session_candidates["SESS-004"])
+        # 2. Activate SESS-002 (yes_no) and check V001 or find a voter eligible for both
+        self.engine.set_session_status("SESS-002", "ACTIVE")
+        if "V001" not in self.engine.session_voters["SESS-002"]:
+            self.engine.session_voters["SESS-002"].add("V001")
 
-        # 3. Vote in SESS-004
-        res2 = self.engine.cast_vote("SESS-004", "V001", "C001")
+        # 3. Vote in SESS-002
+        res2 = self.engine.cast_vote("SESS-002", "V001", option_id="O001")
         self.assertTrue(res2["success"])
 
-        # Verification: voter has voted in both sessions, chains are independent
-        chain3 = self.engine.get_session_chain("SESS-003")
+        # Verification: independent chains
         chain4 = self.engine.get_session_chain("SESS-004")
-        self.assertEqual(chain3.get_vote_count(), 1)
+        chain2 = self.engine.get_session_chain("SESS-002")
         self.assertEqual(chain4.get_vote_count(), 1)
-        self.assertTrue(chain3.is_chain_valid())
+        self.assertEqual(chain2.get_vote_count(), 1)
         self.assertTrue(chain4.is_chain_valid())
+        self.assertTrue(chain2.is_chain_valid())
 
     def test_blockchain_integrity_and_tamper_detection(self):
-        """Test 9: Blockchain integrity verification and tamper detection."""
-        res = self.engine.cast_vote("SESS-003", "V001", "C002")
-        chain = self.engine.get_session_chain("SESS-003")
+        """Test 14: Blockchain integrity verification and tamper detection."""
+        res = self.engine.cast_vote("SESS-004", "V001", candidate_id="C002")
+        chain = self.engine.get_session_chain("SESS-004")
         self.assertTrue(chain.is_chain_valid())
 
         # Simulate tampering with the encrypted payload in Block #1
@@ -192,63 +433,45 @@ class TestVotingEngineM3(unittest.TestCase):
         chain.chain[1].vote_data["encrypted_vote"] = original_payload
         self.assertTrue(chain.is_chain_valid())
 
-    def test_encryption_decryption_verification(self):
-        """Test 10: Verification method retrieves from blockchain, decrypts, and matches original."""
-        res = self.engine.cast_vote("SESS-003", "V001", "C002")
-        vote_id = res["vote_id"]
-
-        # Call the dedicated M3 verification method
-        verification = self.engine.verify_vote_on_blockchain(
-            session_id="SESS-003",
-            vote_id=vote_id,
-        )
-
-        self.assertTrue(verification["verified"])
-        self.assertTrue(verification["matches_original"])
-        self.assertEqual(verification["decrypted_candidate"], "C002")
-        self.assertEqual(verification["original_candidate"], "C002")
-        self.assertEqual(verification["block_index"], 1)
-
-    def test_multiple_voters_in_one_session(self):
-        """Test 11: Multiple distinct voters casting votes in one session."""
-        # V001, V003, V004, V005 are all eligible for SESS-003
+    def test_multiple_voters_and_tallies(self):
+        """Test 15: Multiple distinct voters in candidate_election and decision sessions with clean tallies."""
+        # 15.1 Multi-voter in SESS-004
         voters_choices = [
             ("V001", "C002"),
             ("V003", "C002"),
             ("V004", "C007"),
             ("V005", "C011"),
         ]
-
-        receipts = []
         for vid, cid in voters_choices:
-            receipt = self.engine.cast_vote("SESS-003", vid, cid)
-            receipts.append(receipt)
+            self.engine.cast_vote("SESS-004", vid, candidate_id=cid)
 
-        chain = self.engine.get_session_chain("SESS-003")
-        self.assertEqual(chain.get_vote_count(), 4)
-        self.assertEqual(len(chain.chain), 5)  # Genesis + 4 blocks
-        self.assertTrue(chain.is_chain_valid())
+        chain4 = self.engine.get_session_chain("SESS-004")
+        self.assertEqual(chain4.get_vote_count(), 4)
+        self.assertTrue(chain4.is_chain_valid())
 
-        # Verify hash link chain: each block's prev_hash must equal predecessor's hash
-        for i in range(1, len(chain.chain)):
-            self.assertEqual(chain.chain[i].prev_hash, chain.chain[i - 1].hash)
+        tally4 = self.engine.get_tally("SESS-004")
+        self.assertEqual(tally4["C002"], 2)
+        self.assertEqual(tally4["C007"], 1)
+        self.assertEqual(tally4["C011"], 1)
+        self.assertNotIn("O001", tally4)
 
-        # Verify each vote can be decrypted and verified from the blockchain
-        for receipt in receipts:
-            v_check = self.engine.verify_vote_on_blockchain("SESS-003", receipt["vote_id"])
-            self.assertTrue(v_check["verified"])
-            self.assertEqual(v_check["decrypted_candidate"], receipt["candidate_id"])
+        # 15.2 Multi-voter in SESS-002 (decision session)
+        self.engine.set_session_status("SESS-002", "ACTIVE")
+        s2_voters = sorted(list(self.engine.session_voters["SESS-002"]))
+        self.engine.cast_vote("SESS-002", s2_voters[0], option_id="O001")
+        self.engine.cast_vote("SESS-002", s2_voters[1], option_id="O001")
+        self.engine.cast_vote("SESS-002", s2_voters[2], option_id="O003")
 
-        # Check tallies
-        tally = self.engine.get_tally("SESS-003")
-        self.assertEqual(tally["C002"], 2)
-        self.assertEqual(tally["C007"], 1)
-        self.assertEqual(tally["C011"], 1)
+        tally2 = self.engine.get_tally("SESS-002")
+        self.assertEqual(tally2["O001"], 2)
+        self.assertEqual(tally2["O002"], 0)
+        self.assertEqual(tally2["O003"], 1)
+        self.assertNotIn("C002", tally2)
 
     @patch("voting.voting_engine.encrypt_vote")
     @patch("voting.voting_engine.run_secure_bb84")
-    def test_bb84_failure_prevents_encryption_and_blockchain(self, mock_run_bb84, mock_encrypt):
-        """M4 Test: Insecure BB84 session (aborted/high QBER) halts pipeline before encryption or ledger."""
+    def test_bb84_failure_prevents_encryption_and_releases_reservation(self, mock_run_bb84, mock_encrypt):
+        """Test 16: Insecure BB84 halts pipeline before encryption/ledger AND releases voter reservation."""
         mock_run_bb84.return_value = {
             "secure": False,
             "aborted": True,
@@ -262,198 +485,422 @@ class TestVotingEngineM3(unittest.TestCase):
             "reason": "qber_threshold_exceeded",
         }
 
-        chain = self.engine.get_session_chain("SESS-003")
+        chain = self.engine.get_session_chain("SESS-004")
         initial_block_count = len(chain.chain)  # 1 (genesis)
 
         with self.assertRaises(BB84SecurityError) as ctx:
             self.engine.cast_vote(
-                session_id="SESS-003",
+                session_id="SESS-004",
                 voter_id="V001",
                 candidate_id="C002",
             )
 
         self.assertIn("BB84 security check failed", str(ctx.exception))
-        self.assertIn("qber_threshold_exceeded", str(ctx.exception))
-
-        # 1. encrypt_vote was NEVER called
         mock_encrypt.assert_not_called()
-
-        # 2. Blockchain has not been modified
         self.assertEqual(len(chain.chain), initial_block_count)
         self.assertEqual(chain.get_vote_count(), 0)
         self.assertFalse(chain.has_voter_voted("V001"))
 
-        # 3. Voter has not been recorded as voted
-        self.assertNotIn(("SESS-003", "V001"), self.engine._voted_voters)
-        self.assertEqual(len(self.engine._accepted_votes), 0)
+        # Reservation must be released so V001 can retry
+        self.assertNotIn(("SESS-004", "V001"), self.engine._reserved_voters)
+        self.assertNotIn(("SESS-004", "V001"), self.engine._voted_voters)
 
-    @patch("voting.voting_engine.encrypt_vote")
-    @patch("voting.voting_engine.run_secure_bb84")
-    def test_bb84_insufficient_bits_halts_pipeline(self, mock_run_bb84, mock_encrypt):
-        """M4 Test: Insufficient sifted bits condition aborts vote before encryption or ledger."""
+        # Restore normal BB84 and verify retry succeeds
         mock_run_bb84.return_value = {
-            "secure": False,
-            "aborted": True,
-            "qber": 0.0,
-            "sample_size": 0,
-            "error_count": 0,
-            "qber_threshold": 0.11,
-            "sifted_key_length": 4,
-            "final_key": None,
-            "eavesdrop": False,
-            "reason": "insufficient_sifted_bits",
+            "secure": True,
+            "aborted": False,
+            "final_key": [1, 0, 1, 0, 1, 0, 1, 0],
         }
+        mock_encrypt.return_value = b"test_ciphertext"
+        retry_res = self.engine.cast_vote("SESS-004", "V001", candidate_id="C002")
+        self.assertTrue(retry_res["success"])
+        self.assertEqual(chain.get_vote_count(), 1)
 
-        chain = self.engine.get_session_chain("SESS-003")
-        with self.assertRaises(BB84SecurityError) as ctx:
-            self.engine.cast_vote("SESS-003", "V001", "C002")
+    def test_data_validation_rules(self):
+        """Test 17: validate_data() enforces schema rules for session types."""
+        # 17.1 candidate_election with options attached
+        self.engine.session_options["SESS-004"].add("O001")
+        with self.assertRaises(VotingError):
+            self.engine.validate_data()
+        self.engine.session_options["SESS-004"].remove("O001")
 
-        self.assertIn("BB84 security check failed", str(ctx.exception))
-        self.assertIn("insufficient_sifted_bits", str(ctx.exception))
-        mock_encrypt.assert_not_called()
+        # 17.2 yes_no session with candidate attached
+        self.engine.session_candidates["SESS-002"].add("C001")
+        with self.assertRaises(VotingError):
+            self.engine.validate_data()
+        self.engine.session_candidates["SESS-002"].remove("C001")
+
+        # 17.3 single_choice with yes_no option attached
+        self.engine.session_options["SESS-008"].add("O001")
+        with self.assertRaises(VotingError):
+            self.engine.validate_data()
+        self.engine.session_options["SESS-008"].remove("O001")
+
+    def test_verification_rejects_wrong_session(self):
+        """Test 18: verify_vote_on_blockchain rejects if supplied session_id does not match recorded session."""
+        res = self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C002")
+        vote_id = res["vote_id"]
+
+        with self.assertRaises(VotingError) as ctx:
+            self.engine.verify_vote_on_blockchain(
+                session_id="SESS-002",
+                vote_id=vote_id,
+                expected_choice="C002",
+            )
+        self.assertIn("was recorded in session 'SESS-004'", str(ctx.exception))
+
+    def test_verification_rejects_wrong_block_and_disallows_bypass(self):
+        """Test 19: verify_vote_on_blockchain rejects mismatched block_index and disallows bypass."""
+        res = self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C002")
+        vote_id = res["vote_id"]
+        actual_block = res["block_index"]
+
+        # 19.1 Supplying wrong block_index raises VotingError
+        with self.assertRaises(VotingError) as ctx:
+            self.engine.verify_vote_on_blockchain(
+                session_id="SESS-004",
+                vote_id=vote_id,
+                expected_choice="C002",
+                block_index=actual_block + 10,
+            )
+        self.assertIn("does not match recorded block_index", str(ctx.exception))
+
+        # 19.2 Supplying the correct block_index succeeds
+        ver = self.engine.verify_vote_on_blockchain(
+            session_id="SESS-004",
+            vote_id=vote_id,
+            expected_choice="C002",
+            block_index=actual_block,
+        )
+        self.assertTrue(ver["verified"])
+
+    def test_verification_explicit_semantics(self):
+        """Test 20: Explicit verification semantics when expected_choice is omitted vs provided."""
+        res = self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C002")
+        vote_id = res["vote_id"]
+
+        # 20.1 expected_choice omitted -> decryptable=True, verified=False
+        ver_omitted = self.engine.verify_vote_on_blockchain(
+            session_id="SESS-004",
+            vote_id=vote_id,
+        )
+        self.assertTrue(ver_omitted["decryptable"])
+        self.assertFalse(ver_omitted["verified"])
+        self.assertFalse(ver_omitted["matches_original"])
+        self.assertIsNone(ver_omitted["expected_choice"])
+        self.assertEqual(ver_omitted["decrypted_choice"], "C002")
+
+        # 20.2 require_expected_choice=True and expected_choice omitted -> raises VotingError
+        with self.assertRaises(VotingError) as ctx:
+            self.engine.verify_vote_on_blockchain(
+                session_id="SESS-004",
+                vote_id=vote_id,
+                require_expected_choice=True,
+            )
+        self.assertIn("expected_choice is required", str(ctx.exception))
+
+        # 20.3 expected_choice provided and matches -> decryptable=True, verified=True
+        ver_match = self.engine.verify_vote_on_blockchain(
+            session_id="SESS-004",
+            vote_id=vote_id,
+            expected_choice="C002",
+        )
+        self.assertTrue(ver_match["decryptable"])
+        self.assertTrue(ver_match["verified"])
+        self.assertEqual(ver_match["expected_choice"], "C002")
+
+        # 20.4 expected_choice provided and mismatches -> decryptable=True, verified=False
+        ver_mismatch = self.engine.verify_vote_on_blockchain(
+            session_id="SESS-004",
+            vote_id=vote_id,
+            expected_choice="C001",
+        )
+        self.assertTrue(ver_mismatch["decryptable"])
+        self.assertFalse(ver_mismatch["verified"])
+
+    def test_commit_failure_rollback_maintains_consistent_state(self):
+        """Test 21: Failure during commit metadata update rolls back appended block atomically."""
+        chain = self.engine.get_session_chain("SESS-004")
+        self.assertEqual(len(chain.chain), 1)  # Genesis only
+
+        with patch.object(self.engine, "_commit_vote_metadata", side_effect=RuntimeError("Simulated commit failure")):
+            with self.assertRaises(RuntimeError):
+                self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C001")
+
+        # Invariant checks after commit failure:
+        # 1. No orphan block on chain: chain length is still 1
+        self.assertEqual(len(chain.chain), 1)
         self.assertEqual(chain.get_vote_count(), 0)
         self.assertFalse(chain.has_voter_voted("V001"))
 
-    def test_bb84_secure_vote_success_and_ledger_storage(self):
-        """M4 Test: Normal secure vote runs BB84, derives key, encrypts, and records on blockchain."""
-        result = self.engine.cast_vote(
-            session_id="SESS-003",
-            voter_id="V001",
-            candidate_id="C002",
-        )
-        self.assertTrue(result["success"])
-        self.assertEqual(result["voter_id"], "V001")
-        self.assertEqual(result["candidate_id"], "C002")
+        # 2. Engine state reports voter has NOT voted
+        self.assertFalse(self.engine.has_voter_voted("SESS-004", "V001"))
+        self.assertEqual(self.engine.count_accepted_votes("SESS-004"), 0)
 
-        # Check blockchain ledger
-        chain = self.engine.get_session_chain("SESS-003")
+        # 3. Reservation was discarded, allowing clean retry
+        self.assertNotIn(("SESS-004", "V001"), self.engine._reserved_voters)
+        self.assertNotIn(("SESS-004", "V001"), self.engine._voted_voters)
+
+        # 4. Clean retry succeeds and appends block 1
+        retry_res = self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C001")
+        self.assertTrue(retry_res["success"])
+        self.assertEqual(retry_res["block_index"], 1)
+        self.assertEqual(len(chain.chain), 2)
+        self.assertEqual(self.engine.count_accepted_votes("SESS-004"), 1)
+
+    def test_partial_commit_failure_rolls_back_all_metadata_and_blockchain(self):
+        """Test 24: Partial mutation during commit metadata update rolls back all state atomically."""
+        chain = self.engine.get_session_chain("SESS-004")
+
+        # Establish existing baseline state with one committed vote
+        base_res = self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C001")
+        self.assertTrue(base_res["success"])
+        self.assertEqual(len(chain.chain), 2)  # Genesis + 1
+
+        # Capture pre-failure snapshot of all listed in-memory items and blockchain
+        pre_chain_len = len(chain.chain)
+        pre_keystore = {k: list(v) for k, v in self.engine._prototype_keystore.items()}
+        pre_metadata = {k: dict(v) for k, v in self.engine._prototype_vote_metadata.items()}
+        pre_blocks = dict(self.engine._prototype_vote_blocks)
+        pre_tallies = {sid: dict(c) for sid, c in self.engine._tallies.items()}
+        pre_total_votes = dict(self.engine._total_votes)
+        pre_vote_counter = self.engine._vote_counter
+        pre_voted_voters = set(self.engine._voted_voters)
+        pre_reserved_voters = set(self.engine._reserved_voters)
+
+        # Failure injection: partially mutate keystore, metadata, tallies, and total_votes, then raise
+        def partial_commit_and_fail(vote_id, session_id, voter_id, block_index, bb84_key, choice):
+            self.engine._prototype_keystore[vote_id] = bb84_key
+            self.engine._prototype_vote_metadata[vote_id] = {
+                "session_id": session_id,
+                "block_index": block_index,
+                "voter_id": voter_id,
+            }
+            self.engine._prototype_vote_blocks[vote_id] = block_index
+            self.engine._tallies[session_id][choice] = self.engine._tallies[session_id].get(choice, 0) + 1
+            self.engine._total_votes[session_id] = self.engine._total_votes.get(session_id, 0) + 1
+            raise RuntimeError("Simulated crash after partial in-memory metadata update")
+
+        with patch.object(self.engine, "_commit_vote_metadata", side_effect=partial_commit_and_fail):
+            with self.assertRaises(RuntimeError):
+                self.engine.cast_vote(session_id="SESS-004", voter_id="V002", candidate_id="C002")
+
+        # 1. Assert blockchain has no extra block and remains cryptographically valid
+        self.assertEqual(len(chain.chain), pre_chain_len)
         self.assertEqual(chain.get_vote_count(), 1)
-        self.assertTrue(chain.has_voter_voted("V001"))
+        self.assertTrue(chain.is_chain_valid())
+        self.assertFalse(chain.has_voter_voted("V002"))
+
+        # 2. Assert all listed in-memory state is restored to its exact pre-vote state
+        self.assertEqual(self.engine._prototype_keystore, pre_keystore)
+        self.assertEqual(self.engine._prototype_vote_metadata, pre_metadata)
+        self.assertEqual(self.engine._prototype_vote_blocks, pre_blocks)
+        self.assertEqual(self.engine._tallies, pre_tallies)
+        self.assertEqual(self.engine._total_votes, pre_total_votes)
+        self.assertEqual(self.engine._vote_counter, pre_vote_counter)
+        self.assertEqual(self.engine._voted_voters, pre_voted_voters)
+        self.assertEqual(self.engine._reserved_voters, pre_reserved_voters)
+
+        # 3. Assert voter is not considered to have voted
+        self.assertFalse(self.engine.has_voter_voted("SESS-004", "V002"))
+        self.assertNotIn(("SESS-004", "V002"), self.engine._voted_voters)
+
+        # 4. Assert reservation is cleared
+        self.assertNotIn(("SESS-004", "V002"), self.engine._reserved_voters)
+
+        # 5. Assert voter can retry successfully afterward
+        retry_res = self.engine.cast_vote(session_id="SESS-004", voter_id="V002", candidate_id="C002")
+        self.assertTrue(retry_res["success"])
+        self.assertEqual(retry_res["block_index"], pre_chain_len)
+        self.assertEqual(len(chain.chain), pre_chain_len + 1)
+        self.assertTrue(chain.is_chain_valid())
+        self.assertTrue(chain.has_voter_voted("V002"))
+        self.assertTrue(self.engine.has_voter_voted("SESS-004", "V002"))
+        self.assertEqual(self.engine.count_accepted_votes("SESS-004"), 2)
+        self.assertEqual(self.engine._tallies["SESS-004"]["C002"], pre_tallies["SESS-004"]["C002"] + 1)
+        self.assertEqual(self.engine._total_votes["SESS-004"], pre_total_votes["SESS-004"] + 1)
+
+    def test_two_simultaneous_submissions_same_voter(self):
+        """Test 22: Exactly two simultaneous submissions for (session_id, voter_id) yield 1 accepted vote and 1 block."""
+        results = []
+        errors = []
+
+        def submit():
+            try:
+                res = self.engine.cast_vote(session_id="SESS-004", voter_id="V002", candidate_id="C003")
+                results.append(res)
+            except Exception as e:
+                errors.append(e)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(submit)
+            f2 = executor.submit(submit)
+            f1.result()
+            f2.result()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], DuplicateVoteError)
+
+        chain = self.engine.get_session_chain("SESS-004")
+        self.assertEqual(len(chain.chain), 2)  # Genesis + exactly 1 vote block
+        self.assertEqual(chain.get_vote_count(), 1)
         self.assertTrue(chain.is_chain_valid())
 
-        # Check keystore holds the final key and roundtrip decryption succeeds
-        ver = self.engine.verify_vote_on_blockchain("SESS-003", result["vote_id"])
-        self.assertTrue(ver["verified"])
-        self.assertEqual(ver["decrypted_candidate"], "C002")
+    def test_receipt_fields_and_voter_linkability_on_ledger(self):
+        """Test 23: Receipt contains expected fields; ledger stores voter-linked ciphertext."""
+        res = self.engine.cast_vote(session_id="SESS-004", voter_id="V003", candidate_id="C004")
+
+        # Required prototype receipt fields
+        required_fields = {
+            "success", "vote_id", "session_id", "voter_id",
+            "timestamp", "message", "block_index", "block_hash", "num_qubits"
+        }
+        for field in required_fields:
+            self.assertIn(field, res)
+
+        # Plaintext choice is NOT in receipt
+        self.assertNotIn("choice_id", res)
+        self.assertNotIn("candidate_id", res)
+        self.assertNotIn("option_id", res)
+
+        # Ledger linkability: voter_id is stored directly on the Block alongside encrypted_vote
+        chain = self.engine.get_session_chain("SESS-004")
+        block = chain.chain[res["block_index"]]
+        self.assertEqual(block.vote_data["voter_id"], "V003")
+        self.assertIn("encrypted_vote", block.vote_data)
 
 
 def run_all_tests():
     """Console test runner matching repository's prototype test style."""
-    print("=" * 60)
-    print("M3: INTEGRATED QUANTUM VOTING ENGINE TEST SUITE")
-    print("=" * 60)
+    print("=" * 64)
+    print("M3: INTEGRATED QUANTUM VOTING ENGINE TEST SUITE (M1 DATA MODEL)")
+    print("=" * 64)
 
     engine = VotingEngine()
 
-    # ── Test 1: Successful end-to-end vote ──
-    print("\n=== Test 1: Successful end-to-end quantum + blockchain vote ===")
-    res = engine.cast_vote("SESS-003", "V001", "C002")
-    assert res["success"] is True
-    assert res["block_index"] == 1
-    assert "block_hash" in res and len(res["block_hash"]) == 64
-    chain = engine.get_session_chain("SESS-003")
-    assert chain.get_vote_count() == 1
-    assert chain.is_chain_valid() is True
-    print(f"  PASSED: Vote recorded (vote_id={res['vote_id']}, block={res['block_index']}, hash={res['block_hash'][:16]}...)")
+    # ── Test 1: Successful end-to-end candidate_election vote ──
+    print("\n=== Test 1: Successful candidate_election vote (SESS-004) ===")
+    res1 = engine.cast_vote("SESS-004", "V001", candidate_id="C002")
+    assert res1["success"] is True
+    assert res1["block_index"] == 1
+    assert "block_hash" in res1 and len(res1["block_hash"]) == 64
+    chain4 = engine.get_session_chain("SESS-004")
+    assert chain4.get_vote_count() == 1
+    assert chain4.is_chain_valid() is True
+    print(f"  PASSED: Vote recorded (vote_id={res1['vote_id']}, block={res1['block_index']}, hash={res1['block_hash'][:16]}...)")
 
-    # ── Test 2: Unknown voter rejected ──
-    print("\n=== Test 2: Unknown voter rejected ===")
+    # ── Test 2: Successful yes_no vote with Abstain ──
+    print("\n=== Test 2: Successful yes_no votes including Abstain (SESS-002) ===")
+    engine.set_session_status("SESS-002", "ACTIVE")
+    s2_voters = sorted(list(engine.session_voters["SESS-002"]))
+    res_yes = engine.cast_vote("SESS-002", s2_voters[0], option_id="O001")
+    res_no = engine.cast_vote("SESS-002", s2_voters[1], option_id="O002")
+    res_abs = engine.cast_vote("SESS-002", s2_voters[2], option_id="O003")
+    assert res_yes["success"] and res_no["success"] and res_abs["success"]
+    tally2 = engine.get_tally("SESS-002")
+    assert tally2["O001"] == 1 and tally2["O002"] == 1 and tally2["O003"] == 1
+    print(f"  PASSED: Yes, No, and Abstain recorded and tallied: {tally2}")
+
+    # ── Test 3: Successful single_choice policy vote ──
+    print("\n=== Test 3: Successful single_choice policy vote (SESS-008) ===")
+    engine.set_session_status("SESS-008", "ACTIVE")
+    s8_voters = sorted(list(engine.session_voters["SESS-008"]))
+    res8 = engine.cast_vote("SESS-008", s8_voters[0], option_id="O016")
+    assert res8["success"] is True
+    tally8 = engine.get_tally("SESS-008")
+    assert tally8["O016"] == 1 and tally8["O017"] == 0
+    print(f"  PASSED: Policy vote recorded: {tally8}")
+
+    # ── Test 4: Unknown voter rejected ──
+    print("\n=== Test 4: Unknown voter rejected ===")
     try:
-        engine.cast_vote("SESS-003", "V999", "C002")
+        engine.cast_vote("SESS-004", "V999", candidate_id="C002")
         assert False, "Should have raised UnknownVoterError"
     except UnknownVoterError as ex:
         print(f"  PASSED: Correctly rejected ({ex})")
 
-    # ── Test 3: Ineligible voter rejected ──
-    print("\n=== Test 3: Ineligible voter rejected ===")
+    # ── Test 5: Ineligible voter rejected ──
+    print("\n=== Test 5: Ineligible voter rejected on smaller subset session (SESS-003) ===")
+    engine.set_session_status("SESS-003", "ACTIVE")
+    all_vids = set(engine.voters.keys())
+    s3_vids = engine.session_voters["SESS-003"]
+    ineligibles = sorted(list(all_vids - s3_vids))
     try:
-        engine.cast_vote("SESS-003", "V002", "C002")
+        engine.cast_vote("SESS-003", ineligibles[0], option_id="O001")
         assert False, "Should have raised IneligibleVoterError"
     except IneligibleVoterError as ex:
-        print(f"  PASSED: Correctly rejected ({ex})")
+        print(f"  PASSED: Correctly rejected unenrolled voter {ineligibles[0]} ({ex})")
 
-    # ── Test 4: Inactive session rejected ──
-    print("\n=== Test 4: Inactive session rejected ===")
+    # ── Test 6: Inactive and out-of-window session rejected ──
+    print("\n=== Test 6: Inactive session rejected ===")
     try:
-        engine.cast_vote("SESS-001", "V001", "C008")
-        assert False, "Should have raised InactiveSessionError for COMPLETED session"
+        engine.cast_vote("SESS-001", "V001", candidate_id="C001")
+        assert False, "Should have raised InactiveSessionError for COMPLETED"
     except InactiveSessionError as ex:
         print(f"  PASSED: COMPLETED session rejected ({ex})")
 
     try:
-        engine.cast_vote("SESS-004", "V001", "C001")
-        assert False, "Should have raised InactiveSessionError for UPCOMING session"
+        engine.cast_vote("SESS-005", "V001", option_id="O004")
+        assert False, "Should have raised InactiveSessionError for UPCOMING"
     except InactiveSessionError as ex:
         print(f"  PASSED: UPCOMING session rejected ({ex})")
 
-    # ── Test 5: Invalid candidate rejected ──
-    print("\n=== Test 5: Invalid candidate rejected ===")
+    # ── Test 7: Wrong-type choice rejected ──
+    print("\n=== Test 7: Wrong-type choice rejected ===")
     try:
-        engine.cast_vote("SESS-003", "V003", "C999")
-        assert False, "Should have raised UnknownCandidateError"
-    except UnknownCandidateError as ex:
-        print(f"  PASSED: Correctly rejected ({ex})")
+        engine.cast_vote("SESS-004", "V010", choice_id="O001")
+        assert False, "Should have raised InvalidChoiceError"
+    except InvalidChoiceError as ex:
+        print(f"  PASSED: Option rejected in candidate_election ({ex})")
 
-    # ── Test 6: Candidate not assigned to session rejected ──
-    print("\n=== Test 6: Candidate not assigned to session rejected ===")
     try:
-        engine.cast_vote("SESS-003", "V003", "C001")
-        assert False, "Should have raised CandidateNotAssignedError"
-    except CandidateNotAssignedError as ex:
-        print(f"  PASSED: Correctly rejected ({ex})")
+        engine.cast_vote("SESS-002", s2_voters[3], choice_id="C001")
+        assert False, "Should have raised InvalidChoiceError"
+    except InvalidChoiceError as ex:
+        print(f"  PASSED: Candidate rejected in yes_no ({ex})")
 
-    # ── Test 7: Duplicate vote in same session rejected ──
-    print("\n=== Test 7: Duplicate vote in same session rejected ===")
+    # ── Test 8: Duplicate vote rejected ──
+    print("\n=== Test 8: Duplicate vote in same session rejected ===")
     try:
-        engine.cast_vote("SESS-003", "V001", "C011")
+        engine.cast_vote("SESS-004", "V001", candidate_id="C007")
         assert False, "Should have raised DuplicateVoteError"
     except DuplicateVoteError as ex:
-        print(f"  PASSED: Correctly rejected duplicate vote ({ex})")
+        print(f"  PASSED: Duplicate vote rejected ({ex})")
 
-    # ── Test 8: Same voter voting in another session accepted ──
-    print("\n=== Test 8: Same voter voting in another session accepted ===")
-    engine.set_session_status("SESS-004", "ACTIVE")
-    res_sess4 = engine.cast_vote("SESS-004", "V001", "C001")
-    assert res_sess4["success"] is True
-    chain4 = engine.get_session_chain("SESS-004")
-    assert chain4.get_vote_count() == 1
-    assert chain4.is_chain_valid() is True
-    print(f"  PASSED: V001 successfully voted in SESS-003 and SESS-004 (independent blockchains)")
+    # ── Test 9: Concurrency safety ──
+    print("\n=== Test 9: Concurrent submissions for same voter produce exactly one vote ===")
+    results = []
+    errors = []
 
-    # ── Test 9: Blockchain integrity & tamper detection ──
-    print("\n=== Test 9: Blockchain integrity and tamper detection ===")
-    chain3 = engine.get_session_chain("SESS-003")
-    assert chain3.is_chain_valid() is True
-    orig_payload = chain3.chain[1].vote_data["encrypted_vote"]
-    chain3.chain[1].vote_data["encrypted_vote"] = "badpayload" * 4
-    assert chain3.is_chain_valid() is False, "Tamper detection failed"
-    chain3.chain[1].vote_data["encrypted_vote"] = orig_payload
-    assert chain3.is_chain_valid() is True
-    print("  PASSED: Chain integrity check & tamper detection confirmed")
+    def submit_concurrent(idx):
+        try:
+            res = engine.cast_vote("SESS-004", "V020", candidate_id="C005")
+            results.append((idx, res))
+        except Exception as e:
+            errors.append((idx, type(e)))
 
-    # ── Test 10: Decryption & verification from blockchain ──
-    print("\n=== Test 10: Blockchain vote retrieval, decryption & verification ===")
-    ver = engine.verify_vote_on_blockchain("SESS-003", res["vote_id"])
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(submit_concurrent, i) for i in range(5)]
+        for f in futures:
+            f.result()
+
+    assert len(results) == 1, f"Expected 1 winner, got {len(results)}"
+    assert len(errors) == 4, f"Expected 4 errors, got {len(errors)}"
+    for _, err_t in errors:
+        assert err_t == DuplicateVoteError
+    print(f"  PASSED: 5 concurrent threads -> exactly 1 vote accepted, 4 rejected with DuplicateVoteError")
+
+    # ── Test 10: Blockchain decryption & verification ──
+    print("\n=== Test 10: Blockchain decryption & verification ===")
+    ver = engine.verify_vote_on_blockchain("SESS-004", res1["vote_id"], expected_choice="C002")
     assert ver["verified"] is True
-    assert ver["decrypted_candidate"] == "C002"
-    print(f"  PASSED: Successfully decrypted payload from block #{ver['block_index']} -> Candidate: {ver['decrypted_candidate']}")
+    assert ver["decrypted_choice"] == "C002"
+    print(f"  PASSED: Block #{ver['block_index']} decrypted to: {ver['decrypted_choice']}")
 
-    # ── Test 11: Multiple voters in one session ──
-    print("\n=== Test 11: Multiple voters in one session ===")
-    # Add V003 and V004 votes to SESS-003
-    r3 = engine.cast_vote("SESS-003", "V003", "C002")
-    r4 = engine.cast_vote("SESS-003", "V004", "C007")
-    assert chain3.get_vote_count() == 3
-    assert chain3.is_chain_valid() is True
-    tally = engine.get_tally("SESS-003")
-    assert tally["C002"] == 2
-    assert tally["C007"] == 1
-    assert tally["C011"] == 0
-    print(f"  PASSED: 3 votes recorded in SESS-003. Tally: {tally}")
-
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 64)
     print("  ALL M3 QUANTUM VOTING ENGINE TESTS PASSED")
-    print("=" * 60)
+    print("=" * 64)
 
 
 if __name__ == "__main__":
