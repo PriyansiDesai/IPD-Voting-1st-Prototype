@@ -45,6 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from vol1_encoding import encode_vote
 from voting.voting_engine import (
     VotingEngine,
     VotingError,
@@ -59,6 +60,7 @@ from voting.voting_engine import (
     OptionNotAssignedError,
     DuplicateVoteError,
     BB84SecurityError,
+    get_session_choices,
 )
 
 
@@ -769,6 +771,217 @@ class TestVotingEngineM3(unittest.TestCase):
         block = chain.chain[res["block_index"]]
         self.assertEqual(block.vote_data["voter_id"], "V003")
         self.assertIn("encrypted_vote", block.vote_data)
+
+
+class TestM3QuantumEncodingIntegration(unittest.TestCase):
+    """
+    Dedicated M3 Integration Test Suite:
+    Verifies that the integration between M1 session-specific choice pools,
+    M2 VotingEngine, and vol1_encoding.encode_vote() is correct, explicit,
+    and adheres to quantum encoding and blockchain requirements.
+    """
+
+    def setUp(self):
+        self.engine = VotingEngine()
+
+    def test_choice_pool_passed_to_encode_vote_comes_from_session_never_global(self):
+        """
+        M3 Req 1: Confirm that choice pool passed to encode_vote() comes from the
+        requested session's assignments, never from the global candidates/options list.
+        """
+        # 1. candidate_election (SESS-004)
+        with patch("voting.voting_engine.encode_vote", wraps=encode_vote) as mock_encode:
+            self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C002")
+            mock_encode.assert_called_once()
+            called_pool = mock_encode.call_args[1]["candidates"]
+            expected_cands = self.engine.get_session_choices("SESS-004")
+            self.assertEqual(called_pool, expected_cands)
+            self.assertEqual(len(called_pool), 15)
+            self.assertEqual(called_pool, sorted(list(self.engine.session_candidates["SESS-004"])))
+
+        # 2. yes_no with Abstain (SESS-002)
+        self.engine.set_session_status("SESS-002", "ACTIVE")
+        s2_voter = sorted(list(self.engine.session_voters["SESS-002"]))[0]
+        with patch("voting.voting_engine.encode_vote", wraps=encode_vote) as mock_encode:
+            self.engine.cast_vote(session_id="SESS-002", voter_id=s2_voter, option_id="O003")
+            mock_encode.assert_called_once()
+            called_pool = mock_encode.call_args[1]["candidates"]
+            expected_opts = self.engine.get_session_choices("SESS-002")
+            self.assertEqual(called_pool, expected_opts)
+            self.assertEqual(called_pool, ["O001", "O002", "O003"])
+            self.assertNotIn("O004", called_pool)  # Not global options
+
+        # 3. single_choice (SESS-008)
+        self.engine.set_session_status("SESS-008", "ACTIVE")
+        s8_voter = sorted(list(self.engine.session_voters["SESS-008"]))[0]
+        with patch("voting.voting_engine.encode_vote", wraps=encode_vote) as mock_encode:
+            self.engine.cast_vote(session_id="SESS-008", voter_id=s8_voter, option_id="O016")
+            mock_encode.assert_called_once()
+            called_pool = mock_encode.call_args[1]["candidates"]
+            expected_opts = self.engine.get_session_choices("SESS-008")
+            self.assertEqual(called_pool, expected_opts)
+            self.assertEqual(called_pool, ["O016", "O017", "O018"])
+            self.assertNotIn("O001", called_pool)  # Not options from other sessions
+
+    def test_unassigned_choice_rejected_before_encoding_without_block_or_tally(self):
+        """
+        M3 Req 2: A choice that exists globally but is not assigned to the session
+        must be rejected without calling encode_vote(), without adding a block,
+        and without changing tallies. Tested across all 3 session types.
+        """
+        # 1. candidate_election: SESS-004 has candidates C001..C015.
+        # Temporarily restrict session candidates to C001..C005 in memory for testing
+        self.engine.session_candidates["SESS-004"] = {"C001", "C002", "C003", "C004", "C005"}
+        chain4 = self.engine.get_session_chain("SESS-004")
+        initial_blocks4 = len(chain4.chain)
+        tally4_before = self.engine.get_tally("SESS-004")
+
+        with patch("voting.voting_engine.encode_vote") as mock_encode:
+            with self.assertRaises(CandidateNotAssignedError):
+                # C006 exists globally in candidates.csv, but is not assigned to SESS-004 here
+                self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C006")
+            mock_encode.assert_not_called()
+
+        self.assertEqual(len(chain4.chain), initial_blocks4)
+        self.assertEqual(self.engine.get_tally("SESS-004"), tally4_before)
+        self.assertFalse(self.engine.has_voter_voted("SESS-004", "V001"))
+        self.assertNotIn(("SESS-004", "V001"), self.engine._reserved_voters)
+
+        # 2. yes_no: SESS-003 has only O001 (Yes) and O002 (No); Abstain (O003) is NOT assigned
+        self.engine.set_session_status("SESS-003", "ACTIVE")
+        s3_voter = next(iter(self.engine.session_voters["SESS-003"]))
+        chain3 = self.engine.get_session_chain("SESS-003")
+        initial_blocks3 = len(chain3.chain)
+        tally3_before = self.engine.get_tally("SESS-003")
+
+        with patch("voting.voting_engine.encode_vote") as mock_encode:
+            with self.assertRaises(OptionNotAssignedError):
+                # O003 exists globally in ballot_options.csv, but is not assigned to SESS-003
+                self.engine.cast_vote(session_id="SESS-003", voter_id=s3_voter, option_id="O003")
+            mock_encode.assert_not_called()
+
+        self.assertEqual(len(chain3.chain), initial_blocks3)
+        self.assertEqual(self.engine.get_tally("SESS-003"), tally3_before)
+        self.assertFalse(self.engine.has_voter_voted("SESS-003", s3_voter))
+        self.assertNotIn(("SESS-003", s3_voter), self.engine._reserved_voters)
+
+        # 3. single_choice: SESS-008 has O016, O017, O018.
+        # Option O004 exists globally in ballot_options.csv (assigned to SESS-005), but not SESS-008
+        self.engine.set_session_status("SESS-008", "ACTIVE")
+        s8_voter = sorted(list(self.engine.session_voters["SESS-008"]))[0]
+        chain8 = self.engine.get_session_chain("SESS-008")
+        initial_blocks8 = len(chain8.chain)
+        tally8_before = self.engine.get_tally("SESS-008")
+
+        with patch("voting.voting_engine.encode_vote") as mock_encode:
+            with self.assertRaises(OptionNotAssignedError):
+                self.engine.cast_vote(session_id="SESS-008", voter_id=s8_voter, option_id="O004")
+            mock_encode.assert_not_called()
+
+        self.assertEqual(len(chain8.chain), initial_blocks8)
+        self.assertEqual(self.engine.get_tally("SESS-008"), tally8_before)
+        self.assertFalse(self.engine.has_voter_voted("SESS-008", s8_voter))
+        self.assertNotIn(("SESS-008", s8_voter), self.engine._reserved_voters)
+
+    def test_encoded_values_are_choice_ids_never_display_labels(self):
+        """
+        M3 Req 3: Keep choice IDs as the encoded values. Do not encode display
+        labels or plaintext voter-choice mappings.
+        """
+        # In candidate_election, chosen_candidate must be 'C001', not candidate name
+        with patch("voting.voting_engine.encode_vote", wraps=encode_vote) as mock_encode:
+            res = self.engine.cast_vote(session_id="SESS-004", voter_id="V001", candidate_id="C001")
+            call_chosen = mock_encode.call_args[1]["chosen_candidate"]
+            self.assertEqual(call_chosen, "C001")
+            self.assertNotEqual(call_chosen, self.engine.candidates["C001"]["candidate_name"])
+
+        # In yes_no, chosen_candidate must be 'O001', not 'Yes'
+        self.engine.set_session_status("SESS-002", "ACTIVE")
+        s2_voter = sorted(list(self.engine.session_voters["SESS-002"]))[0]
+        with patch("voting.voting_engine.encode_vote", wraps=encode_vote) as mock_encode:
+            res_yn = self.engine.cast_vote(session_id="SESS-002", voter_id=s2_voter, option_id="O001")
+            call_chosen_yn = mock_encode.call_args[1]["chosen_candidate"]
+            self.assertEqual(call_chosen_yn, "O001")
+            self.assertNotEqual(call_chosen_yn, "Yes")
+
+    def test_quantum_encoding_roundtrip_correctness_various_pool_sizes(self):
+        """
+        M3 Req 4: Tests for encoding round-trip correctness with different numbers
+        of assigned choices, including the project's 15-candidate session.
+        """
+        # Pool size 2 (1 qubit): e.g. Yes/No session (SESS-003)
+        pool_2 = ["O001", "O002"]
+        for opt in pool_2:
+            enc = encode_vote(pool_2, opt)
+            self.assertEqual(enc["num_qubits"], 1)
+            self.assertEqual(enc["decoded_candidate"], opt)
+
+        # Pool size 3 (2 qubits): e.g. Yes/No/Abstain session (SESS-002)
+        pool_3 = ["O001", "O002", "O003"]
+        for opt in pool_3:
+            enc = encode_vote(pool_3, opt)
+            self.assertEqual(enc["num_qubits"], 2)
+            self.assertEqual(enc["decoded_candidate"], opt)
+
+        # Pool size 5 (3 qubits): e.g. SESS-005 single choice grant funding
+        pool_5 = ["O004", "O005", "O006", "O007", "O008"]
+        for opt in pool_5:
+            enc = encode_vote(pool_5, opt)
+            self.assertEqual(enc["num_qubits"], 3)
+            self.assertEqual(enc["decoded_candidate"], opt)
+
+        # Pool size 15 (4 qubits): full 15 candidates from SESS-004
+        pool_15 = [f"C{i:03d}" for i in range(1, 16)]
+        self.assertEqual(len(pool_15), 15)
+        for cand in pool_15:
+            enc = encode_vote(pool_15, cand)
+            self.assertEqual(enc["num_qubits"], 4)
+            self.assertEqual(enc["decoded_candidate"], cand)
+
+    def test_encoding_to_blockchain_association_and_verification(self):
+        """
+        M3 Req 5: Confirm encoding/decoding returns the same selected ID and that
+        the resulting encrypted vote is associated with the correct session's blockchain record.
+        """
+        # candidate_election
+        res = self.engine.cast_vote(session_id="SESS-004", voter_id="V005", candidate_id="C012")
+        self.assertEqual(res["num_qubits"], 4)
+        ver = self.engine.verify_vote_on_blockchain(
+            session_id="SESS-004",
+            vote_id=res["vote_id"],
+            expected_choice="C012",
+        )
+        self.assertTrue(ver["verified"])
+        self.assertEqual(ver["decrypted_choice"], "C012")
+        self.assertEqual(ver["session_id"], "SESS-004")
+
+        # yes_no
+        self.engine.set_session_status("SESS-002", "ACTIVE")
+        s2_voter = sorted(list(self.engine.session_voters["SESS-002"]))[0]
+        res_yn = self.engine.cast_vote(session_id="SESS-002", voter_id=s2_voter, option_id="O003")
+        self.assertEqual(res_yn["num_qubits"], 2)
+        ver_yn = self.engine.verify_vote_on_blockchain(
+            session_id="SESS-002",
+            vote_id=res_yn["vote_id"],
+            expected_choice="O003",
+        )
+        self.assertTrue(ver_yn["verified"])
+        self.assertEqual(ver_yn["decrypted_choice"], "O003")
+        self.assertEqual(ver_yn["session_id"], "SESS-002")
+
+        # single_choice
+        self.engine.set_session_status("SESS-008", "ACTIVE")
+        s8_voter = sorted(list(self.engine.session_voters["SESS-008"]))[0]
+        res_sc = self.engine.cast_vote(session_id="SESS-008", voter_id=s8_voter, option_id="O018")
+        self.assertEqual(res_sc["num_qubits"], 2)
+        ver_sc = self.engine.verify_vote_on_blockchain(
+            session_id="SESS-008",
+            vote_id=res_sc["vote_id"],
+            expected_choice="O018",
+        )
+        self.assertTrue(ver_sc["verified"])
+        self.assertEqual(ver_sc["decrypted_choice"], "O018")
+        self.assertEqual(ver_sc["session_id"], "SESS-008")
 
 
 def run_all_tests():

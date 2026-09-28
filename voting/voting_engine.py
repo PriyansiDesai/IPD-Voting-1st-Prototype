@@ -446,6 +446,25 @@ class VotingEngine:
                 self.session_chains[sid] = Blockchain()
             return self.session_chains[sid]
 
+    def get_session_choices(self, session_id: str) -> List[str]:
+        """
+        Returns the sorted list of valid choice IDs assigned to the session.
+        - For candidate_election: returns candidate_ids (people candidates only).
+        - For yes_no and single_choice: returns option_ids.
+        Raises UnknownSessionError if session_id does not exist.
+        """
+        sid = str(session_id).strip()
+        with self._lock:
+            if sid not in self.sessions:
+                raise UnknownSessionError(f"Session '{sid}' not found.")
+            stype = self.sessions[sid].get("session_type", "")
+            if stype == "candidate_election":
+                return sorted(list(self.session_candidates.get(sid, set())))
+            elif stype in ("yes_no", "single_choice"):
+                return sorted(list(self.session_options.get(sid, set())))
+            else:
+                return []
+
     def cast_vote(
         self,
         session_id: str,
@@ -967,3 +986,8 @@ def count_accepted_votes(
 def get_tally(session_id: str) -> Dict[str, int]:
     """Module-level helper to retrieve tallies using the default VotingEngine instance."""
     return get_default_engine().get_tally(session_id)
+
+
+def get_session_choices(session_id: str) -> List[str]:
+    """Module-level helper to retrieve assigned choice IDs using the default VotingEngine instance."""
+    return get_default_engine().get_session_choices(session_id)
