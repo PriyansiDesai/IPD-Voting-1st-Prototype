@@ -1,7 +1,7 @@
 option_id,option_label,option_type
 O001,Yes,yes_no
 O002,No,yes_no
-O003,Abstain,yes_no
+O003,Abstain,abstain
 O004,Project Alpha,project
 O005,Project Beta,project
 O006,Project Gamma,project
@@ -14,3 +14,6 @@ O012,Provider South,provider
 O013,Provider East,provider
 O014,Provider West,provider
 O015,Provider Global,provider
+O016,Policy Option A,policy
+O017,Policy Option B,policy
+O018,Policy Option C,policy
