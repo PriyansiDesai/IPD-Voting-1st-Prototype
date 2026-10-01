@@ -1,9 +1,9 @@
 session_id,title,question,session_type,start_time,end_time,status
-SESS-001,Board Representative Election,Who should represent employees on the board?,candidate_election,2026-08-31T03:46:40Z,2026-08-31T11:46:40Z,COMPLETED
-SESS-002,Project Alpha Approval,Should the organisation approve Project Alpha?,yes_no,2026-09-10T03:46:40Z,2026-09-10T11:46:40Z,COMPLETED
-SESS-003,Hybrid Work Policy,Should the proposed hybrid work policy be adopted?,yes_no,2026-09-20T03:46:40Z,2026-09-22T03:46:40Z,COMPLETED
-SESS-004,Department Head Election,Who should be elected as Department Head?,candidate_election,2026-09-28T01:46:40Z,2026-09-28T13:46:40Z,ACTIVE
-SESS-005,Research Grant Funding,Which project should receive the research grant?,single_choice,2026-10-05T03:46:40Z,2026-10-06T11:46:40Z,UPCOMING
-SESS-006,Benefits Provider Selection,Which provider should the organisation select?,single_choice,2026-10-12T03:46:40Z,2026-10-13T12:46:40Z,UPCOMING
-SESS-007,Remote Work Allowance Policy,Should the remote work allowance be increased?,yes_no,2026-10-19T03:46:40Z,2026-10-20T11:46:40Z,UPCOMING
-SESS-008,Corporate Sustainability Initiative Priority,Which sustainability policy initiative should be funded for Q4?,single_choice,2026-10-26T03:46:40Z,2026-10-27T11:46:40Z,UPCOMING
+SESS-001,Board Representative Election,Who should represent employees on the board?,candidate_election,2026-09-03T03:09:59Z,2026-09-03T11:09:59Z,COMPLETED
+SESS-002,Project Alpha Approval,Should the organisation approve Project Alpha?,yes_no,2026-09-13T03:09:59Z,2026-09-13T11:09:59Z,COMPLETED
+SESS-003,Hybrid Work Policy,Should the proposed hybrid work policy be adopted?,yes_no,2026-09-23T03:09:59Z,2026-09-25T03:09:59Z,COMPLETED
+SESS-004,Department Head Election,Who should be elected as Department Head?,candidate_election,2026-10-01T01:09:59Z,2026-10-01T13:09:59Z,ACTIVE
+SESS-005,Research Grant Funding,Which project should receive the research grant?,single_choice,2026-10-08T03:09:59Z,2026-10-09T11:09:59Z,UPCOMING
+SESS-006,Benefits Provider Selection,Which provider should the organisation select?,single_choice,2026-10-15T03:09:59Z,2026-10-16T12:09:59Z,UPCOMING
+SESS-007,Remote Work Allowance Policy,Should the remote work allowance be increased?,yes_no,2026-10-22T03:09:59Z,2026-10-23T11:09:59Z,UPCOMING
+SESS-008,Corporate Sustainability Initiative Priority,Which sustainability policy initiative should be funded for Q4?,single_choice,2026-10-29T03:09:59Z,2026-10-30T11:09:59Z,UPCOMING

@@ -70,6 +70,9 @@ class TestVotingEngineM3(unittest.TestCase):
     def setUp(self):
         # Create fresh engine instance before each test
         self.engine = VotingEngine()
+        # Activate SESS-004 with a valid current voting window so tests
+        # never depend on the (possibly stale) CSV timestamps.
+        self.engine.set_session_status("SESS-004", "ACTIVE")
 
     def test_successful_end_to_end_vote_candidate_election(self):
         """Test 1: Successful end-to-end vote in candidate_election session (SESS-004, ACTIVE)."""
@@ -783,6 +786,9 @@ class TestM3QuantumEncodingIntegration(unittest.TestCase):
 
     def setUp(self):
         self.engine = VotingEngine()
+        # Activate SESS-004 with a valid current voting window so tests
+        # never depend on the (possibly stale) CSV timestamps.
+        self.engine.set_session_status("SESS-004", "ACTIVE")
 
     def test_choice_pool_passed_to_encode_vote_comes_from_session_never_global(self):
         """
@@ -991,6 +997,8 @@ def run_all_tests():
     print("=" * 64)
 
     engine = VotingEngine()
+    # Activate SESS-004 with a valid current voting window.
+    engine.set_session_status("SESS-004", "ACTIVE")
 
     # ── Test 1: Successful end-to-end candidate_election vote ──
     print("\n=== Test 1: Successful candidate_election vote (SESS-004) ===")
