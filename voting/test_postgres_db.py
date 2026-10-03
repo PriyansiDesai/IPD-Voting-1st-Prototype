@@ -385,6 +385,47 @@ class TestPostgresVotingRepository(unittest.TestCase):
         finally:
             self.repo.pool.putconn(conn)
             
+        # Mid-transaction DB failure test: trigger failure after participation update and ballot insert,
+        # but during audit_ledger insert, by adding a temporary check constraint.
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("ALTER TABLE audit_ledger ADD CONSTRAINT fail_test CHECK (encrypted_vote_payload != 'FAIL_ME')")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+            
+        try:
+            from psycopg2.errors import CheckViolation
+            with self.assertRaises(CheckViolation) as ctx:
+                self.repo.finalize_vote('S1', 'V1', token, "FAIL_ME")
+            self.assertIn("fail_test", str(ctx.exception))
+                
+            # Verify transaction rolled back completely
+            conn = self.repo.get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT status FROM voter_participation WHERE session_id='S1' AND voter_id='V1'")
+                    self.assertEqual(cur.fetchone()[0], 'PENDING')
+                    
+                    cur.execute("SELECT COUNT(*) FROM ballots WHERE session_id='S1' AND encrypted_vote_payload='FAIL_ME'")
+                    self.assertEqual(cur.fetchone()[0], 0)
+                    
+                    cur.execute("SELECT COUNT(*) FROM audit_ledger WHERE session_id='S1' AND encrypted_vote_payload='FAIL_ME'")
+                    self.assertEqual(cur.fetchone()[0], 0)
+            finally:
+                self.repo.pool.putconn(conn)
+        finally:
+            # Clean up the constraint
+            conn = self.repo.get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("ALTER TABLE audit_ledger DROP CONSTRAINT fail_test")
+                conn.commit()
+            finally:
+                self.repo.pool.putconn(conn)
+                
+
     def test_postgres_read_methods(self):
         """Test 7: Postgres read methods (session lookup, choices, participation)."""
         self._create_basic_session()
@@ -571,10 +612,36 @@ class TestPostgresVotingRepository(unittest.TestCase):
         self.repo.update_session_status('S_CANCEL', 'COMPLETED')
         self.assertEqual(self.repo.get_session_details('S_CANCEL')['status'], 'COMPLETED')
         
-        # Test rollback on failure (e.g. invalid candidate ID)
-        with self.assertRaises(Exception):
+        # Test rollback on failure (invalid choice)
+        from psycopg2.errors import ForeignKeyViolation
+        with self.assertRaises(ForeignKeyViolation):
             self.repo.setup_session('S_FAIL3', 'Fail', 'candidate_election', start, end, ['V_NEW'], ['INVALID_CANDIDATE'])
         self.assertIsNone(self.repo.get_session_details('S_FAIL3'))
+        
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM session_voters WHERE session_id='S_FAIL3'")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("SELECT COUNT(*) FROM session_choices WHERE session_id='S_FAIL3'")
+                self.assertEqual(cur.fetchone()[0], 0)
+        finally:
+            self.repo.pool.putconn(conn)
+        
+        # Test rollback on failure (invalid voter)
+        with self.assertRaises(ForeignKeyViolation):
+            self.repo.setup_session('S_FAIL4', 'Fail Voter', 'candidate_election', start, end, ['INVALID_VOTER'], ['C_NEW'])
+        self.assertIsNone(self.repo.get_session_details('S_FAIL4'))
+        
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM session_voters WHERE session_id='S_FAIL4'")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute("SELECT COUNT(*) FROM session_choices WHERE session_id='S_FAIL4'")
+                self.assertEqual(cur.fetchone()[0], 0)
+        finally:
+            self.repo.pool.putconn(conn)
 
 if __name__ == '__main__':
     unittest.main()
