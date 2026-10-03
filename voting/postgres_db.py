@@ -167,71 +167,88 @@ class PostgresVotingRepository:
             self.pool.putconn(conn)
 
     def reserve_vote(self, session_id: str, voter_id: str, idempotency_key: str) -> Tuple[bool, Optional[str], Optional[str]]:
-        conn = self.get_connection()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT status, start_time, end_time FROM voting_sessions WHERE session_id = %s FOR SHARE", (session_id,))
-                session = cur.fetchone()
-                if not session:
-                    raise ValueError(f"Session {session_id} not found.")
-                
-                if session['status'] != 'ACTIVE':
-                    raise ValueError(f"Session {session_id} is not ACTIVE.")
-                
-                cur.execute("SELECT CURRENT_TIMESTAMP")
-                now = cur.fetchone()['current_timestamp']
-                if now < session['start_time'] or now >= session['end_time']:
-                    raise ValueError("Current time is outside the valid session window.")
-                
-                cur.execute("SELECT 1 FROM voters WHERE voter_id = %s", (voter_id,))
-                if not cur.fetchone():
-                    raise ValueError(f"Voter {voter_id} not found.")
-                
-                cur.execute("SELECT 1 FROM session_voters WHERE session_id = %s AND voter_id = %s", (session_id, voter_id))
-                if not cur.fetchone():
-                    raise ValueError(f"Voter {voter_id} is not eligible for session {session_id}.")
-                
-                cur.execute("SELECT status, idempotency_key, receipt_id, reservation_token FROM voter_participation WHERE session_id = %s AND voter_id = %s", (session_id, voter_id))
-                part = cur.fetchone()
-                
-                token = str(uuid.uuid4())
-                if part:
-                    if part['status'] == 'COMMITTED':
-                        if part['idempotency_key'] == idempotency_key:
-                            return False, None, part['receipt_id']
+        for attempt in range(5):
+            conn = self.get_connection()
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT status, start_time, end_time FROM voting_sessions WHERE session_id = %s FOR SHARE", (session_id,))
+                    session = cur.fetchone()
+                    if not session:
+                        raise ValueError(f"Session {session_id} not found.")
+                    
+                    if session['status'] != 'ACTIVE':
+                        raise ValueError(f"Session {session_id} is not ACTIVE.")
+                    
+                    cur.execute("SELECT CURRENT_TIMESTAMP")
+                    now = cur.fetchone()['current_timestamp']
+                    if now < session['start_time'] or now >= session['end_time']:
+                        raise ValueError("Current time is outside the valid session window.")
+                    
+                    cur.execute("SELECT 1 FROM voters WHERE voter_id = %s", (voter_id,))
+                    if not cur.fetchone():
+                        raise ValueError(f"Voter {voter_id} not found.")
+                    
+                    cur.execute("SELECT 1 FROM session_voters WHERE session_id = %s AND voter_id = %s", (session_id, voter_id))
+                    if not cur.fetchone():
+                        raise ValueError(f"Voter {voter_id} is not eligible for session {session_id}.")
+                    
+                    cur.execute("SELECT status, idempotency_key, receipt_id, reservation_token, reserved_at FROM voter_participation WHERE session_id = %s AND voter_id = %s", (session_id, voter_id))
+                    part = cur.fetchone()
+                    
+                    token = str(uuid.uuid4())
+                    should_continue = False
+                    if part:
+                        if part['status'] == 'COMMITTED':
+                            if part['idempotency_key'] == idempotency_key:
+                                return False, None, part['receipt_id']
+                            else:
+                                raise ValueError("Voter has already cast a vote.")
+                        elif part['status'] == 'PENDING':
+                            res_ts = part['reserved_at']
+                            if now - res_ts <= timedelta(minutes=5):
+                                if part['idempotency_key'] == idempotency_key:
+                                    return True, part['reservation_token'], None
+                                else:
+                                    raise ValueError("A vote is currently being processed.")
+                            else:
+                                # Reclaim stale reservation atomically
+                                cur.execute("""
+                                    UPDATE voter_participation 
+                                    SET reservation_token = %s, reserved_at = CURRENT_TIMESTAMP, idempotency_key = %s 
+                                    WHERE session_id = %s AND voter_id = %s AND reservation_token = %s AND status = 'PENDING'
+                                """, (token, idempotency_key, session_id, voter_id, part['reservation_token']))
+                                
+                                if cur.rowcount == 0:
+                                    conn.rollback()
+                                    should_continue = True
+                                else:
+                                    conn.commit()
+                                    return True, token, None
+                    
+                    if not should_continue:
+                        cur.execute("""
+                            INSERT INTO voter_participation (session_id, voter_id, reservation_token, status, idempotency_key, reserved_at)
+                            VALUES (%s, %s, %s, 'PENDING', %s, CURRENT_TIMESTAMP)
+                            ON CONFLICT (session_id, voter_id) DO NOTHING
+                        """, (session_id, voter_id, token, idempotency_key))
+                        
+                        if cur.rowcount == 0:
+                            conn.rollback()
+                            should_continue = True
                         else:
-                            raise ValueError("Voter has already cast a vote.")
-                    elif part['status'] == 'PENDING':
-                        if part['idempotency_key'] == idempotency_key:
-                            return True, part['reservation_token'], None
-                        else:
-                            cur.execute("SELECT CURRENT_TIMESTAMP")
-                            now_ts = cur.fetchone()['current_timestamp']
-                            cur.execute("SELECT reserved_at FROM voter_participation WHERE session_id = %s AND voter_id = %s", (session_id, voter_id))
-                            res_ts = cur.fetchone()['reserved_at']
-                            if now_ts - res_ts > timedelta(minutes=5):
-                                cur.execute("UPDATE voter_participation SET reservation_token = %s, reserved_at = CURRENT_TIMESTAMP, idempotency_key = %s WHERE session_id = %s AND voter_id = %s", (token, idempotency_key, session_id, voter_id))
-                                conn.commit()
-                                return True, token, None
-                            raise ValueError("A vote is currently being processed.")
+                            conn.commit()
+                            return True, token, None
+                            
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                self.pool.putconn(conn)
                 
-                cur.execute("""
-                    INSERT INTO voter_participation (session_id, voter_id, reservation_token, status, idempotency_key, reserved_at)
-                    VALUES (%s, %s, %s, 'PENDING', %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (session_id, voter_id) DO NOTHING
-                """, (session_id, voter_id, token, idempotency_key))
+            if should_continue:
+                continue
                 
-                if cur.rowcount == 0:
-                    conn.rollback()
-                    return self.reserve_vote(session_id, voter_id, idempotency_key)
-                
-                conn.commit()
-                return True, token, None
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self.pool.putconn(conn)
+        raise RuntimeError("Failed to reserve vote after maximum retries due to concurrency.")
 
     def validate_choice(self, session_id: str, choice_id: str) -> bool:
         conn = self.get_connection()
@@ -259,6 +276,7 @@ class PostgresVotingRepository:
                     UPDATE voter_participation
                     SET status = 'COMMITTED', reservation_token = NULL
                     WHERE session_id = %s AND voter_id = %s AND reservation_token = %s AND status = 'PENDING'
+                      AND reserved_at >= CURRENT_TIMESTAMP - INTERVAL '5 minutes'
                 """, (session_id, voter_id, reservation_token))
                 
                 if cur.rowcount == 0:

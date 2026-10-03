@@ -222,6 +222,143 @@ class TestPostgresVotingRepository(unittest.TestCase):
             self.repo.reserve_vote('S1', 'V1', ik2)
         self.assertIn("already cast a vote", str(ctx.exception))
         
+    def test_stale_vote_recovery(self):
+        """Test stale PENDING vote recovery, lease retry, reclaim, and concurrency."""
+        import datetime
+        self._create_basic_session()
+        ik1 = str(uuid.uuid4())
+        
+        # 1. Initial reservation
+        s, token1, rec1 = self.repo.reserve_vote('S1', 'V1', ik1)
+        self.assertTrue(s)
+        self.assertIsNotNone(token1)
+        
+        # 2. Retry before expiry with same key (should reuse)
+        s2, token2, rec2 = self.repo.reserve_vote('S1', 'V1', ik1)
+        self.assertTrue(s2)
+        self.assertEqual(token1, token2)
+        
+        # 3. Simulate expiry by manually backdating the reservation
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE voter_participation SET reserved_at = CURRENT_TIMESTAMP - INTERVAL '6 minutes' WHERE session_id = 'S1' AND voter_id = 'V1'")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+            
+        # 4. Reclaim after expiry (should issue new token)
+        ik2 = str(uuid.uuid4())
+        s3, token3, rec3 = self.repo.reserve_vote('S1', 'V1', ik2)
+        self.assertTrue(s3)
+        self.assertNotEqual(token1, token3)
+        self.assertIsNotNone(token3)
+        
+        # 5. Old-token finalization rejected after reclaim
+        with self.assertRaises(ValueError) as ctx:
+            self.repo.finalize_vote('S1', 'V1', token1, "ENCRYPTED_DATA")
+        self.assertIn("Reservation is stale, expired, or invalid", str(ctx.exception))
+        
+        # 6. Finalize with new token succeeds
+        receipt = self.repo.finalize_vote('S1', 'V1', token3, "ENCRYPTED_DATA_NEW")
+        self.assertIsNotNone(receipt)
+        
+        # 7. Concurrency Test for Reclaim
+        # Set up a new expired reservation
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO voters (voter_id, name, department, role) VALUES ('V2', 'Eve', 'HR', 'Employee') ON CONFLICT DO NOTHING")
+                cur.execute("INSERT INTO session_voters (session_id, voter_id) VALUES ('S1', 'V2') ON CONFLICT DO NOTHING")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+            
+        ik_c = str(uuid.uuid4())
+        self.repo.reserve_vote('S1', 'V2', ik_c)
+        
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE voter_participation SET reserved_at = CURRENT_TIMESTAMP - INTERVAL '6 minutes' WHERE session_id = 'S1' AND voter_id = 'V2'")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+            
+        import threading
+        barrier = threading.Barrier(2)
+        
+        # Two workers trying to reclaim the same expired reservation concurrently
+        results = []
+        errors = []
+        def worker(ik):
+            try:
+                barrier.wait()
+                s, token, rec = self.repo.reserve_vote('S1', 'V2', ik)
+                results.append(token)
+            except Exception as e:
+                errors.append(str(e))
+                
+        ik_w1 = str(uuid.uuid4())
+        ik_w2 = str(uuid.uuid4())
+        
+        t1 = threading.Thread(target=worker, args=(ik_w1,))
+        t2 = threading.Thread(target=worker, args=(ik_w2,))
+        
+        t1.start()
+        t2.start()
+        
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        
+        self.assertFalse(t1.is_alive())
+        self.assertFalse(t2.is_alive())
+        
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("A vote is currently being processed.", errors[0])
+        
+        # 8. Test finalize_vote on an expired reservation before any reclaim
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO voters (voter_id, name, department, role) VALUES ('V3', 'Charlie', 'IT', 'Admin') ON CONFLICT DO NOTHING")
+                cur.execute("INSERT INTO session_voters (session_id, voter_id) VALUES ('S1', 'V3') ON CONFLICT DO NOTHING")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+            
+        ik_v3 = str(uuid.uuid4())
+        s, token_v3, rec = self.repo.reserve_vote('S1', 'V3', ik_v3)
+        self.assertTrue(s)
+        
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE voter_participation SET reserved_at = CURRENT_TIMESTAMP - INTERVAL '6 minutes' WHERE session_id = 'S1' AND voter_id = 'V3'")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+            
+        # Try to finalize with the expired token before any worker reclaims it
+        with self.assertRaises(ValueError) as ctx:
+            self.repo.finalize_vote('S1', 'V3', token_v3, "EXPIRED_DATA")
+        self.assertIn("Reservation is stale, expired, or invalid", str(ctx.exception))
+        
+        # Verify no ballot/audit row created for V3
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status FROM voter_participation WHERE session_id='S1' AND voter_id='V3'")
+                self.assertEqual(cur.fetchone()[0], 'PENDING')
+                
+                cur.execute("SELECT COUNT(*) FROM ballots WHERE session_id='S1' AND encrypted_vote_payload='EXPIRED_DATA'")
+                self.assertEqual(cur.fetchone()[0], 0)
+                
+                cur.execute("SELECT COUNT(*) FROM audit_ledger WHERE session_id='S1' AND encrypted_vote_payload='EXPIRED_DATA'")
+                self.assertEqual(cur.fetchone()[0], 0)
+        finally:
+            self.repo.pool.putconn(conn)
     def test_rollback_on_finalization_failure(self):
         """Test 6: Rollback on finalization failure."""
         self._create_basic_session()
