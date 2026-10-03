@@ -69,7 +69,7 @@ class TestVotingEngineM3(unittest.TestCase):
 
     def setUp(self):
         # Create fresh engine instance before each test
-        self.engine = VotingEngine()
+        self.engine = VotingEngine(use_postgres=False)
         # Activate SESS-004 with a valid current voting window so tests
         # never depend on the (possibly stale) CSV timestamps.
         self.engine.set_session_status("SESS-004", "ACTIVE")
@@ -514,12 +514,37 @@ class TestVotingEngineM3(unittest.TestCase):
         mock_run_bb84.return_value = {
             "secure": True,
             "aborted": False,
-            "final_key": [1, 0, 1, 0, 1, 0, 1, 0],
+            "final_key": [1, 0] * 128,
         }
         mock_encrypt.return_value = b"test_ciphertext"
         retry_res = self.engine.cast_vote("SESS-004", "V001", candidate_id="C002")
         self.assertTrue(retry_res["success"])
         self.assertEqual(chain.get_vote_count(), 1)
+
+    @patch("voting.voting_engine.encrypt_vote")
+    @patch("voting.voting_engine.run_secure_bb84")
+    def test_bb84_undersized_key_fails_closed_and_releases_reservation(self, mock_run_bb84, mock_encrypt):
+        """M4/M2: BB84 returning undersized key (<256 bits) fails closed and releases reservation."""
+        mock_run_bb84.return_value = {
+            "secure": True,
+            "aborted": False,
+            "final_key": [1, 0] * 64,  # Only 128 bits
+        }
+
+        chain = self.engine.get_session_chain("SESS-004")
+        initial_block_count = len(chain.chain)
+
+        with self.assertRaises(BB84SecurityError) as ctx:
+            self.engine.cast_vote(
+                session_id="SESS-004",
+                voter_id="V001",
+                candidate_id="C002",
+            )
+
+        self.assertIn("undersized or invalid key", str(ctx.exception))
+        mock_encrypt.assert_not_called()
+        self.assertEqual(len(chain.chain), initial_block_count)
+        self.assertNotIn(("SESS-004", "V001"), self.engine._reserved_voters)
 
     def test_data_validation_rules(self):
         """Test 17: validate_data() enforces schema rules for session types."""
@@ -785,7 +810,7 @@ class TestM3QuantumEncodingIntegration(unittest.TestCase):
     """
 
     def setUp(self):
-        self.engine = VotingEngine()
+        self.engine = VotingEngine(use_postgres=False)
         # Activate SESS-004 with a valid current voting window so tests
         # never depend on the (possibly stale) CSV timestamps.
         self.engine.set_session_status("SESS-004", "ACTIVE")
@@ -996,7 +1021,7 @@ def run_all_tests():
     print("M3: INTEGRATED QUANTUM VOTING ENGINE TEST SUITE (M1 DATA MODEL)")
     print("=" * 64)
 
-    engine = VotingEngine()
+    engine = VotingEngine(use_postgres=False)
     # Activate SESS-004 with a valid current voting window.
     engine.set_session_status("SESS-004", "ACTIVE")
 

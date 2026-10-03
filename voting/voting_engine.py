@@ -131,7 +131,22 @@ class VotingEngine:
         data_dir: Optional[Path | str] = None,
         auto_load: bool = True,
         reference_time: Optional[datetime] = None,
+        use_postgres: Optional[bool] = None,
     ):
+        import os
+        if use_postgres is None:
+            self.use_postgres = not bool(os.environ.get("USE_MEMORY_STORAGE"))
+        else:
+            self.use_postgres = use_postgres
+
+        self.repo = None
+        if self.use_postgres:
+            db_url = os.environ.get("DATABASE_URL")
+            if not db_url:
+                raise ValueError("DATABASE_URL environment variable is required when PostgreSQL is selected. To use memory storage, set USE_MEMORY_STORAGE=1.")
+            from voting.postgres_db import PostgresVotingRepository
+            self.repo = PostgresVotingRepository(db_url)
+
         if data_dir is None:
             self.data_dir = Path(__file__).resolve().parent.parent / "data"
         else:
@@ -174,7 +189,7 @@ class VotingEngine:
         self._prototype_vote_metadata: Dict[str, Dict[str, Any]] = {}
         self._prototype_vote_blocks: Dict[str, int] = {}
 
-        if auto_load:
+        if auto_load and not self.use_postgres:
             self.load_data()
             self.validate_data()
 
@@ -454,6 +469,11 @@ class VotingEngine:
         Raises UnknownSessionError if session_id does not exist.
         """
         sid = str(session_id).strip()
+        if self.use_postgres:
+            choices = self.repo.get_session_choices(sid)
+            if choices is None:
+                raise UnknownSessionError(f"Session '{sid}' not found.")
+            return choices
         with self._lock:
             if sid not in self.sessions:
                 raise UnknownSessionError(f"Session '{sid}' not found.")
@@ -472,6 +492,7 @@ class VotingEngine:
         choice_id: Optional[str] = None,
         candidate_id: Optional[str] = None,
         option_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes the complete M3 Quantum & Blockchain voting pipeline across all session types.
@@ -507,6 +528,43 @@ class VotingEngine:
 
         param_name, raw_choice = non_none[0]
         choice = str(raw_choice).strip()
+
+        if self.use_postgres:
+            if not getattr(self, 'repo', None):
+                raise VotingError("PostgreSQL repository not initialized.")
+            if not idempotency_key:
+                import uuid
+                idempotency_key = str(uuid.uuid4())
+            if not self.repo.validate_choice(session_id, choice):
+                raise InvalidChoiceError(f"Choice not valid for session.")
+            success, reservation_token, existing_receipt = self.repo.reserve_vote(session_id, voter_id, idempotency_key)
+            if not success:
+                return {"status": "success", "message": "Idempotent response.", "receipt": existing_receipt}
+
+            try:
+                # 3.1 Quantum Vote Encoding (vol1)
+                encoded_result = encode_vote(candidates=[choice], chosen_candidate=choice)
+                encoded_choice = encoded_result["decoded_candidate"]
+
+                # 3.2 BB84 Quantum Key Distribution (vol2) - M4 Security Gate
+                bb84_result = run_secure_bb84(min_key_length=256)
+                if not bb84_result.get("secure", False) or bb84_result.get("aborted", True):
+                    reason = bb84_result.get("reason", "unknown")
+                    raise BB84SecurityError(f"BB84 security check failed: {reason}")
+                bb84_key = bb84_result["final_key"]
+                if len(bb84_key) < 256:
+                    raise BB84SecurityError("BB84 security check failed: undersized or invalid key.")
+
+                # 3.3 Post-Quantum Encryption (vol3)
+                ciphertext_bytes = encrypt_vote(vote_data=encoded_choice, bb84_key=bb84_key)
+                ciphertext_hex = ciphertext_bytes.hex()
+            except Exception as e:
+                # Since postgres handles the reservation state in a database transaction,
+                # a failure here means the reservation will eventually expire.
+                raise VotingError(f"Cryptographic pipeline failed: {str(e)}")
+
+            receipt = self.repo.finalize_vote(session_id, voter_id, reservation_token, ciphertext_hex)
+            return {"status": "success", "message": "Vote cast and recorded on PostgreSQL.", "receipt": receipt, "num_qubits": encoded_result.get("num_qubits")}
 
         # ── Step 2: Atomic Reservation & Pre-Execution Validation ────────────
         with self._lock:
@@ -623,12 +681,14 @@ class VotingEngine:
             encoded_choice = encoded_result["decoded_candidate"]
 
             # 3.2 BB84 Quantum Key Distribution (vol2) - M4 Security Gate
-            bb84_result = run_secure_bb84(min_key_length=8)
+            bb84_result = run_secure_bb84(min_key_length=256)
             if not bb84_result.get("secure", False) or bb84_result.get("aborted", True):
                 reason = bb84_result.get("reason", "unknown")
                 raise BB84SecurityError(f"BB84 security check failed: {reason}")
 
             bb84_key = bb84_result["final_key"]
+            if len(bb84_key) < 256:
+                raise BB84SecurityError("BB84 security check failed: undersized or invalid key.")
 
             # 3.3 Post-Quantum Encryption (vol3)
             ciphertext_bytes = encrypt_vote(vote_data=encoded_choice, bb84_key=bb84_key)
@@ -843,6 +903,8 @@ class VotingEngine:
         """Checks if a voter has already cast a vote in the specified session."""
         sid = str(session_id).strip()
         vid = str(voter_id).strip()
+        if self.use_postgres:
+            return self.repo.has_voter_voted(sid, vid)
         with self._lock:
             engine_voted = (sid, vid) in self._voted_voters
             chain_voted = False
@@ -858,6 +920,8 @@ class VotingEngine:
         choice_id: Optional[str] = None,
     ) -> int:
         """Returns aggregate vote count from in-memory tallies without traversing vote records."""
+        if self.use_postgres:
+            raise NotImplementedError("Tally methods are currently unsupported in PostgreSQL mode because votes are encrypted.")
         target_choice = choice_id or candidate_id or option_id
         with self._lock:
             if session_id is not None:
@@ -891,6 +955,8 @@ class VotingEngine:
         Returns vote counts for each candidate or option assigned to the specified session.
         Maintained as aggregate counts only. Initializes unvoted assigned choices to 0.
         """
+        if self.use_postgres:
+            raise NotImplementedError("Tally methods are currently unsupported in PostgreSQL mode because votes are encrypted.")
         sid = str(session_id).strip()
         with self._lock:
             if sid not in self.sessions:
@@ -957,6 +1023,7 @@ def cast_vote(
     choice_id: Optional[str] = None,
     candidate_id: Optional[str] = None,
     option_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Module-level helper to cast a vote using the default VotingEngine instance."""
     return get_default_engine().cast_vote(
@@ -965,6 +1032,7 @@ def cast_vote(
         choice_id=choice_id,
         candidate_id=candidate_id,
         option_id=option_id,
+        idempotency_key=idempotency_key,
     )
 
 
