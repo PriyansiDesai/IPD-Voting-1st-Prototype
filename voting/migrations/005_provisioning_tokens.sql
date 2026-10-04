@@ -16,3 +16,14 @@ CREATE TABLE IF NOT EXISTS provisioning_tokens (
 -- GRANT SELECT ON voters TO voting_admin;
 -- GRANT SELECT, INSERT, UPDATE ON provisioning_tokens TO voting_admin;
 -- GRANT SELECT, INSERT ON voter_identities TO voting_admin;
+
+DO
+$do$
+BEGIN
+   IF EXISTS (
+      SELECT FROM pg_catalog.pg_roles
+      WHERE  rolname = 'voting_app') THEN
+      REVOKE ALL PRIVILEGES ON TABLE provisioning_tokens FROM voting_app;
+   END IF;
+END
+$do$;

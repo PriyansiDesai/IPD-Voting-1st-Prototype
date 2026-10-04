@@ -106,3 +106,72 @@ class TestAdminProvisioning(unittest.TestCase):
         
         with self.assertRaisesRegex(ValueError, "Identity mapping already exists"):
             self.admin_repo.consume_token_and_link(raw_token2, 'https://auth.example.com/', 'sub-unique')
+
+    def test_role_privileges(self):
+        import uuid
+        test_id = str(uuid.uuid4()).replace('-', '_')
+        app_role = f"voting_app_test_{test_id}"
+        admin_role = f"voting_admin_test_{test_id}"
+        
+        conn = psycopg2.connect(self.dsn)
+        try:
+            with conn.cursor() as cur:
+                # Setup roles for the test
+                cur.execute(f"CREATE ROLE {app_role}")
+                cur.execute(f"CREATE ROLE {admin_role}")
+                
+                # Apply voting_app simulated grants (as per DATABASE_ROLES.md)
+                cur.execute(f"GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO {app_role}")
+                cur.execute(f"REVOKE INSERT, UPDATE, DELETE ON TABLE voter_identities FROM {app_role}")
+                cur.execute(f"REVOKE ALL PRIVILEGES ON TABLE provisioning_tokens FROM {app_role}")
+                
+                # Apply voting_admin simulated grants
+                cur.execute(f"GRANT SELECT ON voters TO {admin_role}")
+                cur.execute(f"GRANT SELECT, INSERT, UPDATE ON provisioning_tokens TO {admin_role}")
+                cur.execute(f"GRANT SELECT, INSERT ON voter_identities TO {admin_role}")
+                
+            conn.commit()
+            
+            # Test voting_app restrictions
+            with conn.cursor() as cur:
+                cur.execute(f"SET ROLE {app_role}")
+                
+                # Should not be able to read provisioning_tokens
+                with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                    cur.execute("SELECT * FROM provisioning_tokens")
+                conn.rollback()
+
+                cur.execute(f"SET ROLE {app_role}")
+                # Should not be able to insert voter_identities
+                with self.assertRaises(psycopg2.errors.InsufficientPrivilege):
+                    cur.execute("INSERT INTO voter_identities (issuer, subject, voter_id) VALUES ('test', 'test', 'V_TEST_PROV')")
+                conn.rollback()
+                
+            # Test voting_admin privileges
+            with conn.cursor() as cur:
+                cur.execute(f"SET ROLE {admin_role}")
+                # Should be able to read provisioning_tokens
+                cur.execute("SELECT * FROM provisioning_tokens")
+                # Should be able to insert voter_identities
+                try:
+                    cur.execute("INSERT INTO voter_identities (issuer, subject, voter_id) VALUES ('test_admin', 'test_admin', 'V_TEST_PROV')")
+                except psycopg2.errors.UniqueViolation:
+                    pass
+                conn.rollback()
+                
+        finally:
+            conn.rollback()  # Rollback any open transaction from the tests
+            with conn.cursor() as cur:
+                cur.execute("RESET ROLE")
+                # Safely remove only these roles' privileges and objects in this database
+                cur.execute(f"DROP OWNED BY {app_role} CASCADE")
+                cur.execute(f"DROP OWNED BY {admin_role} CASCADE")
+                cur.execute(f"DROP ROLE {app_role}")
+                cur.execute(f"DROP ROLE {admin_role}")
+                
+                # Confirm both generated roles have been removed
+                cur.execute("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname IN (%s, %s)", (app_role, admin_role))
+                if cur.fetchone():
+                    raise RuntimeError("Cleanup failed: temporary roles were not fully removed.")
+            conn.commit()
+            conn.close()

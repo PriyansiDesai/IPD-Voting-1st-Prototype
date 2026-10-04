@@ -56,6 +56,25 @@ GRANT SELECT ON TABLE schema_migrations TO voting_app;
 -- Restrict identity mappings (Runtime must only read mappings, never write them)
 GRANT SELECT ON TABLE voter_identities TO voting_app;
 REVOKE INSERT, UPDATE, DELETE ON TABLE voter_identities FROM voting_app;
+
+-- Restrict provisioning tokens (Runtime must not read or write tokens)
+REVOKE ALL PRIVILEGES ON TABLE provisioning_tokens FROM voting_app;
+```
+
+## 5. Provisioning Admin Role (`voting_admin`)
+**Purpose:** Executes out-of-band single-use identity provisioning and token issuance. Not connected to `api.py` or the runtime application.
+**Privileges:**
+- Read-only access to `voters`.
+- `SELECT`, `INSERT`, `UPDATE` on `provisioning_tokens`.
+- `SELECT`, `INSERT` on `voter_identities`.
+- No access to ballots, ledgers, or session data.
+```sql
+CREATE ROLE voting_admin WITH LOGIN PASSWORD '<REPLACE_WITH_SECURE_PASSWORD>';
+GRANT CONNECT ON DATABASE ipd_voting_prod TO voting_admin;
+GRANT USAGE ON SCHEMA public TO voting_admin;
+GRANT SELECT ON voters TO voting_admin;
+GRANT SELECT, INSERT, UPDATE ON provisioning_tokens TO voting_admin;
+GRANT SELECT, INSERT ON voter_identities TO voting_admin;
 ```
 
 ## 3. Retention Role (`voting_retention`)
