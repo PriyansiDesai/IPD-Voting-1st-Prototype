@@ -174,23 +174,28 @@ class PostgresVotingRepository:
                     cur.execute("SELECT status, start_time, end_time FROM voting_sessions WHERE session_id = %s FOR SHARE", (session_id,))
                     session = cur.fetchone()
                     if not session:
-                        raise ValueError(f"Session {session_id} not found.")
+                        from voting.voting_engine import UnknownSessionError
+                        raise UnknownSessionError(f"Session {session_id} not found.")
 
                     if session['status'] != 'ACTIVE':
-                        raise ValueError(f"Session {session_id} is not ACTIVE.")
+                        from voting.voting_engine import InactiveSessionError
+                        raise InactiveSessionError(f"Session {session_id} is not ACTIVE.")
 
                     cur.execute("SELECT CURRENT_TIMESTAMP")
                     now = cur.fetchone()['current_timestamp']
                     if now < session['start_time'] or now >= session['end_time']:
-                        raise ValueError("Current time is outside the valid session window.")
+                        from voting.voting_engine import InactiveSessionError
+                        raise InactiveSessionError("Current time is outside the valid session window.")
 
                     cur.execute("SELECT 1 FROM voters WHERE voter_id = %s", (voter_id,))
                     if not cur.fetchone():
-                        raise ValueError(f"Voter {voter_id} not found.")
+                        from voting.voting_engine import UnknownVoterError
+                        raise UnknownVoterError(f"Voter {voter_id} not found.")
 
                     cur.execute("SELECT 1 FROM session_voters WHERE session_id = %s AND voter_id = %s", (session_id, voter_id))
                     if not cur.fetchone():
-                        raise ValueError(f"Voter {voter_id} is not eligible for session {session_id}.")
+                        from voting.voting_engine import IneligibleVoterError
+                        raise IneligibleVoterError(f"Voter {voter_id} is not eligible for session {session_id}.")
 
                     cur.execute("SELECT status, idempotency_key, receipt_id, reservation_token, reserved_at FROM voter_participation WHERE session_id = %s AND voter_id = %s", (session_id, voter_id))
                     part = cur.fetchone()
@@ -202,14 +207,16 @@ class PostgresVotingRepository:
                             if part['idempotency_key'] == idempotency_key:
                                 return False, None, part['receipt_id']
                             else:
-                                raise ValueError("Voter has already cast a vote.")
+                                from voting.voting_engine import DuplicateVoteError
+                                raise DuplicateVoteError("Voter has already cast a vote.")
                         elif part['status'] == 'PENDING':
                             res_ts = part['reserved_at']
                             if now - res_ts <= timedelta(minutes=5):
                                 if part['idempotency_key'] == idempotency_key:
                                     return True, part['reservation_token'], None
                                 else:
-                                    raise ValueError("A vote is currently being processed.")
+                                    from voting.voting_engine import DuplicateVoteError
+                                    raise DuplicateVoteError("A vote is currently being processed.")
                             else:
                                 # Reclaim stale reservation atomically
                                 cur.execute("""
@@ -254,6 +261,11 @@ class PostgresVotingRepository:
         conn = self.get_connection()
         try:
             with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM voting_sessions WHERE session_id = %s", (session_id,))
+                if not cur.fetchone():
+                    from voting.voting_engine import UnknownSessionError
+                    raise UnknownSessionError(f"Session {session_id} not found.")
+
                 cur.execute("""
                     SELECT 1 FROM session_choices
                     WHERE session_id = %s AND (candidate_id = %s OR option_id = %s)
@@ -312,6 +324,16 @@ class PostgresVotingRepository:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute('SELECT * FROM voting_sessions WHERE session_id = %s', (session_id,))
                 return cur.fetchone()
+        finally:
+            self.pool.putconn(conn)
+
+    def get_voter_id_by_identity(self, issuer: str, subject: str) -> Optional[str]:
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT voter_id FROM voter_identities WHERE issuer = %s AND subject = %s", (issuer, subject))
+                row = cur.fetchone()
+                return row[0] if row else None
         finally:
             self.pool.putconn(conn)
 

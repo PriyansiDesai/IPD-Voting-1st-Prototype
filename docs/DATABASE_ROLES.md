@@ -23,15 +23,39 @@ ALTER DEFAULT PRIVILEGES FOR ROLE voting_migrator IN SCHEMA public GRANT ALL ON 
 **Privileges:**
 - `SELECT`, `INSERT`, `UPDATE` on operational tables.
 - **Restrictions:** Cannot `DROP` tables, `ALTER` schema, or modify migration ledger tables (`schema_migrations`). Cannot `DELETE` arbitrary tables.
+
+**Setup Sequence:**
+Follow these steps in order to ensure permissions are applied correctly:
+
+### Step 1: Create the Role
+Create the `voting_app` role first:
 ```sql
 CREATE ROLE voting_app WITH LOGIN PASSWORD '<REPLACE_WITH_SECURE_PASSWORD>';
+```
+
+### Step 2: Apply Migrations
+Apply all schema migrations (including `004_voter_identities.sql`).
+*Note: Migration 004 dynamically grants `SELECT` on `voter_identities` if the `voting_app` role already exists.*
+
+### Step 3: Apply Post-Migration Grants
+After all migrations are complete, apply the runtime-role grants to the existing tables. This includes an explicit `GRANT SELECT` and `REVOKE INSERT, UPDATE, DELETE` on `voter_identities`. The runtime role must not be able to change identity mappings.
+
+*If the `voting_app` role is created after migration 004, this post-migration grant step is required to safely restrict permissions.*
+```sql
+-- Apply baseline operational grants
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO voting_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO voting_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE ON TABLES TO voting_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO voting_app;
+
+-- Restrict sensitive schema and migration structures
 REVOKE CREATE ON SCHEMA public FROM voting_app;
 REVOKE ALL PRIVILEGES ON TABLE schema_migrations FROM voting_app;
 GRANT SELECT ON TABLE schema_migrations TO voting_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE ON TABLES TO voting_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO voting_app;
+
+-- Restrict identity mappings (Runtime must only read mappings, never write them)
+GRANT SELECT ON TABLE voter_identities TO voting_app;
+REVOKE INSERT, UPDATE, DELETE ON TABLE voter_identities FROM voting_app;
 ```
 
 ## 3. Retention Role (`voting_retention`)
