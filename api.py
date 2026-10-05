@@ -258,3 +258,12 @@ def admin_toggle_legal_hold(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get('/admin/check-auth')
+def admin_check_auth(principal: Principal = Depends(require_admin)):
+    if os.environ.get("DEV_ADMIN_CHECK_ENABLED") != "1":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not Found"
+        )
+    return {'status': 'success', 'message': 'Admin check passed'}

@@ -408,5 +408,62 @@ class TestVotingAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertIn("Admin permission required", response.json()["detail"])
 
+
+class TestAdminCheckAuth(unittest.TestCase):
+    @patch.dict(os.environ, {"DEV_ADMIN_CHECK_ENABLED": "1"})
+    def test_admin_check_auth(self):
+        from api import app, get_current_principal, Principal
+        # pyrefly: ignore [missing-import]
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        def override_principal():
+            return Principal(issuer='test-issuer', subject='admin-subject', permissions=['admin'])
+        app.dependency_overrides[get_current_principal] = override_principal
+        response = client.get('/admin/check-auth')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'success')
+
+    @patch.dict(os.environ, {"DEV_ADMIN_CHECK_ENABLED": "1"})
+    def test_admin_check_auth_forbidden_for_user(self):
+        from api import app, get_current_principal, Principal
+        # pyrefly: ignore [missing-import]
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        def override_principal():
+            return Principal(issuer='test-issuer', subject='test-subject', permissions=[])
+        app.dependency_overrides[get_current_principal] = override_principal
+        response = client.get('/admin/check-auth')
+        self.assertEqual(response.status_code, 403)
+
+    @patch.dict(os.environ, {"DEV_ADMIN_CHECK_ENABLED": "1"})
+    def test_admin_check_auth_missing_authentication(self):
+        from api import app, get_current_principal, Principal
+        # pyrefly: ignore [missing-import]
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        if get_current_principal in app.dependency_overrides:
+            del app.dependency_overrides[get_current_principal]
+        response = client.get('/admin/check-auth')
+        self.assertEqual(response.status_code, 401)
+
+    def test_admin_check_auth_disabled_flag(self):
+        from api import app, get_current_principal, Principal
+        # pyrefly: ignore [missing-import]
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        def override_principal():
+            return Principal(issuer='test-issuer', subject='admin-subject', permissions=['admin'])
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        # Test when not set
+        with patch.dict(os.environ, {}, clear=True):
+            response = client.get('/admin/check-auth')
+            self.assertEqual(response.status_code, 404)
+
+        # Test when set to 0
+        with patch.dict(os.environ, {"DEV_ADMIN_CHECK_ENABLED": "0"}):
+            response = client.get('/admin/check-auth')
+            self.assertEqual(response.status_code, 404)
+
 if __name__ == "__main__":
     unittest.main()
