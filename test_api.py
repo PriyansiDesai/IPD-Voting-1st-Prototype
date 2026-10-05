@@ -2,8 +2,28 @@ import unittest
 import os
 import uuid
 import datetime
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from unittest.mock import patch, MagicMock
+# pyrefly: ignore [missing-import]
+import jwt
 # pyrefly: ignore [missing-import]
 from fastapi.testclient import TestClient
+
+test_private_key = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+)
+test_private_pem = test_private_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption()
+)
+test_public_key = test_private_key.public_key()
+test_public_pem = test_public_key.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo
+)
 
 test_db_url = os.environ.get("TEST_DATABASE_URL")
 HAS_POSTGRES = bool(test_db_url)
@@ -332,6 +352,61 @@ class TestVotingAPI(unittest.TestCase):
         response = client.post("/admin/sessions/S1/legal-hold", json={"active": True})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "success")
+
+    @patch('api.OIDC_ISSUER', 'test-issuer')
+    @patch('api.OIDC_AUDIENCE', 'test-audience')
+    @patch('api.jwks_client')
+    def test_real_jwt_admin_authorized(self, mock_jwks_client):
+        # Setup mock jwks client to return our public key
+        mock_key = MagicMock()
+        mock_key.key = test_public_pem
+        mock_jwks_client.get_signing_key_from_jwt.return_value = mock_key
+
+        # Create valid JWT
+        payload = {
+            "iss": "test-issuer",
+            "sub": "admin-subject",
+            "aud": "test-audience",
+            "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1),
+            "permissions": ["admin"]
+        }
+        token = jwt.encode(payload, test_private_pem, algorithm="RS256")
+
+        # Make request to admin route
+        response = client.post(
+            "/admin/sessions/S1/status",
+            json={"status": "COMPLETED", "reason": "Testing JWT"},
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "success")
+
+    @patch('api.OIDC_ISSUER', 'test-issuer')
+    @patch('api.OIDC_AUDIENCE', 'test-audience')
+    @patch('api.jwks_client')
+    def test_real_jwt_admin_forbidden_for_user(self, mock_jwks_client):
+        # Setup mock jwks client
+        mock_key = MagicMock()
+        mock_key.key = test_public_pem
+        mock_jwks_client.get_signing_key_from_jwt.return_value = mock_key
+
+        # Create valid JWT without "admin" permission
+        payload = {
+            "iss": "test-issuer",
+            "sub": "user-subject",
+            "aud": "test-audience",
+            "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1),
+            "permissions": ["read"] # No admin
+        }
+        token = jwt.encode(payload, test_private_pem, algorithm="RS256")
+
+        response = client.post(
+            "/admin/sessions/S1/status",
+            json={"status": "COMPLETED", "reason": "Testing JWT"},
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Admin permission required", response.json()["detail"])
 
 if __name__ == "__main__":
     unittest.main()
