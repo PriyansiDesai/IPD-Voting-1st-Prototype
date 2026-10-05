@@ -337,6 +337,46 @@ class PostgresVotingRepository:
         finally:
             self.pool.putconn(conn)
 
+    def get_voter_sessions(self, voter_id: str) -> list:
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                query = """
+                    SELECT vs.session_id, vs.title, vs.question, vs.session_type, vs.start_time, vs.end_time, vs.status
+                    FROM voting_sessions vs
+                    JOIN session_voters sv ON vs.session_id = sv.session_id
+                    WHERE sv.voter_id = %s
+                      AND vs.status = 'ACTIVE'
+                      AND vs.start_time <= CURRENT_TIMESTAMP
+                      AND CURRENT_TIMESTAMP < vs.end_time
+                """
+                cur.execute(query, (voter_id,))
+                return cur.fetchall()
+        finally:
+            self.pool.putconn(conn)
+
+    def get_voter_session_details(self, voter_id: str, session_id: str) -> Optional[dict]:
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                query = """
+                    SELECT vs.session_id, vs.title, vs.question, vs.session_type, vs.start_time, vs.end_time, vs.status
+                    FROM voting_sessions vs
+                    JOIN session_voters sv ON vs.session_id = sv.session_id
+                    WHERE sv.voter_id = %s AND vs.session_id = %s
+                """
+                cur.execute(query, (voter_id, session_id))
+                session_details = cur.fetchone()
+
+                if not session_details:
+                    return None
+
+                choices = self.get_session_choices(session_id)
+                session_details['choices'] = choices
+                return session_details
+        finally:
+            self.pool.putconn(conn)
+
     def get_session_choices(self, session_id: str):
         conn = self.get_connection()
         try:

@@ -68,7 +68,7 @@ class TestVotingAPI(unittest.TestCase):
             conn.commit()
         finally:
             self.repo.pool.putconn(conn)
-        
+
         # Reset dependency override before each test
         app.dependency_overrides = {}
 
@@ -91,7 +91,7 @@ class TestVotingAPI(unittest.TestCase):
         def override_principal():
             return Principal(issuer="test-issuer", subject="unknown-subject")
         app.dependency_overrides[get_current_principal] = override_principal
-        
+
         ik = str(uuid.uuid4())
         response = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik})
         self.assertEqual(response.status_code, 403)
@@ -101,7 +101,7 @@ class TestVotingAPI(unittest.TestCase):
         def override_principal():
             return Principal(issuer="test-issuer", subject="test-subject")
         app.dependency_overrides[get_current_principal] = override_principal
-        
+
         ik = str(uuid.uuid4())
         response = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik})
         self.assertEqual(response.status_code, 200)
@@ -113,7 +113,7 @@ class TestVotingAPI(unittest.TestCase):
         def override_principal():
             return Principal(issuer="test-issuer", subject="test-subject")
         app.dependency_overrides[get_current_principal] = override_principal
-        
+
         ik1 = str(uuid.uuid4())
         # First vote
         res1 = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik1})
@@ -135,7 +135,7 @@ class TestVotingAPI(unittest.TestCase):
         def override_principal():
             return Principal(issuer="test-issuer", subject="test-subject")
         app.dependency_overrides[get_current_principal] = override_principal
-        
+
         ik = str(uuid.uuid4())
         response = client.post("/vote", json={"session_id": "UNKNOWN", "candidate_id": "C1"}, headers={"Idempotency-Key": ik})
         self.assertEqual(response.status_code, 404)
@@ -155,7 +155,7 @@ class TestVotingAPI(unittest.TestCase):
             conn.commit()
         finally:
             self.repo.pool.putconn(conn)
-        
+
         ik = str(uuid.uuid4())
         # V2 is not in session_voters for S1
         response = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik})
@@ -166,11 +166,171 @@ class TestVotingAPI(unittest.TestCase):
         def override_principal():
             return Principal(issuer="test-issuer", subject="test-subject")
         app.dependency_overrides[get_current_principal] = override_principal
-        
+
         ik = str(uuid.uuid4())
         response = client.post("/vote", json={"session_id": "S1", "candidate_id": "UNKNOWN_CANDIDATE"}, headers={"Idempotency-Key": ik})
         self.assertEqual(response.status_code, 422)
         self.assertIn("Choice not valid", response.json()["detail"])
+
+    def test_get_sessions_eligible_voter(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        response = client.get("/sessions")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("sessions", data)
+        self.assertEqual(len(data["sessions"]), 1)
+        self.assertEqual(data["sessions"][0]["session_id"], "S1")
+
+    def test_get_sessions_unmapped_identity(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="unknown-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        response = client.get("/sessions")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Unknown identity", response.json()["detail"])
+
+    def test_get_sessions_no_eligible_sessions(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject-2")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        # Create the mapping for V2
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO voters (voter_id, name, department, role) VALUES ('V2', 'Eve', 'HR', 'Employee')")
+                cur.execute("INSERT INTO voter_identities (issuer, subject, voter_id) VALUES ('test-issuer', 'test-subject-2', 'V2')")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+
+        response = client.get("/sessions")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("sessions", data)
+        self.assertEqual(len(data["sessions"]), 0)
+
+    def test_get_sessions_outside_window_excluded(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        # Create the mapping for V1 to two new sessions, one before start, one after end
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO voting_sessions (session_id, title, session_type, start_time, end_time, status) VALUES ('S_PAST', 'Past', 'candidate_election', '2000-01-01', '2001-01-01', 'ACTIVE')")
+                cur.execute("INSERT INTO session_voters (session_id, voter_id) VALUES ('S_PAST', 'V1')")
+
+                cur.execute("INSERT INTO voting_sessions (session_id, title, session_type, start_time, end_time, status) VALUES ('S_FUTURE', 'Future', 'candidate_election', '2100-01-01', '2101-01-01', 'ACTIVE')")
+                cur.execute("INSERT INTO session_voters (session_id, voter_id) VALUES ('S_FUTURE', 'V1')")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+
+        response = client.get("/sessions")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("sessions", data)
+
+        # Should only contain S1 (from setUp), not S_PAST or S_FUTURE
+        session_ids = [s["session_id"] for s in data["sessions"]]
+        self.assertIn("S1", session_ids)
+        self.assertNotIn("S_PAST", session_ids)
+        self.assertNotIn("S_FUTURE", session_ids)
+
+    def test_get_session_details_assigned_voter(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        response = client.get("/sessions/S1")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["session_id"], "S1")
+        self.assertIn("choices", data)
+        self.assertEqual(data["choices"], ["C1"])
+
+    def test_get_session_details_unmapped_identity(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="unknown-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        response = client.get("/sessions/S1")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Unknown identity", response.json()["detail"])
+
+    def test_get_session_details_unassigned_voter(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject-2")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        # Create the mapping for V2
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO voters (voter_id, name, department, role) VALUES ('V2', 'Eve', 'HR', 'Employee')")
+                cur.execute("INSERT INTO voter_identities (issuer, subject, voter_id) VALUES ('test-issuer', 'test-subject-2', 'V2')")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+
+        response = client.get("/sessions/S1")
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("not found or not assigned", response.json()["detail"])
+
+    def test_get_session_details_unknown_session(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        response = client.get("/sessions/UNKNOWN_SESSION")
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("not found or not assigned", response.json()["detail"])
+
+    def test_admin_routes_forbidden_for_voter(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject", permissions=[])
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        response = client.post("/admin/sessions/S1/status", json={"status": "COMPLETED"})
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Admin permission required", response.json()["detail"])
+
+    def test_admin_update_session_status(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="admin-subject", permissions=["admin"])
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        # ACTIVE -> COMPLETED is valid
+        response = client.post("/admin/sessions/S1/status", json={"status": "COMPLETED", "reason": "Testing"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "success")
+
+    def test_admin_certify_session(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="admin-subject", permissions=["admin"])
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        # Must be COMPLETED first to be certified
+        client.post("/admin/sessions/S1/status", json={"status": "COMPLETED", "reason": "Testing"})
+
+        response = client.post("/admin/sessions/S1/certify")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "success")
+
+    def test_admin_toggle_legal_hold(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="admin-subject", permissions=["admin"])
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        response = client.post("/admin/sessions/S1/legal-hold", json={"active": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "success")
 
 if __name__ == "__main__":
     unittest.main()
