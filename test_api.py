@@ -2,6 +2,7 @@ import unittest
 import os
 import uuid
 import datetime
+# pyrefly: ignore [missing-import]
 from fastapi.testclient import TestClient
 
 test_db_url = os.environ.get("TEST_DATABASE_URL")
