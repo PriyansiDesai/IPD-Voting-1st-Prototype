@@ -94,12 +94,14 @@ class TestVotingAPI(unittest.TestCase):
         app.dependency_overrides = {}
 
     def tearDown(self):
-        if hasattr(self, 'repo') and self.repo.pool:
-            self.repo.pool.closeall()
+        if hasattr(self, "repo") and self.repo.pool:
+            if not self.repo.pool.closed:
+                self.repo.pool.closeall()
         # Make sure API engine's connections are closed
         if engine and engine.repo and engine.repo.pool:
-            engine.repo.pool.closeall()
-            engine.repo = PostgresVotingRepository(self.dsn) # refresh for next test
+            if not engine.repo.pool.closed:
+                engine.repo.pool.closeall()
+            engine.repo = PostgresVotingRepository(self.dsn)
 
     def test_missing_authentication(self):
         # Should get 401 because get_current_principal raises it by default
@@ -312,6 +314,75 @@ class TestVotingAPI(unittest.TestCase):
         response = client.get("/sessions/UNKNOWN_SESSION")
         self.assertEqual(response.status_code, 404)
         self.assertIn("not found or not assigned", response.json()["detail"])
+
+    def test_postgres_commit_and_recreate_engine(self):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        import api
+        original_engine = api.engine
+
+        try:
+            ik1 = str(uuid.uuid4())
+            # Cast a vote
+            response = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik1})
+            self.assertEqual(response.status_code, 200)
+
+            # Close engine pool and recreate engine
+            if api.engine and api.engine.repo and api.engine.repo.pool:
+                api.engine.repo.pool.closeall()
+            from voting.voting_engine import VotingEngine
+            api.engine = VotingEngine(use_postgres=True)
+
+            # Confirm participation remains committed (second vote rejected)
+            ik2 = str(uuid.uuid4())
+            response2 = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik2})
+            self.assertEqual(response2.status_code, 409)
+            self.assertIn("already cast a vote", response2.json()["detail"])
+        finally:
+            if api.engine and api.engine.repo and api.engine.repo.pool:
+                api.engine.repo.pool.closeall()
+            api.engine = original_engine
+            if get_current_principal in app.dependency_overrides:
+                del app.dependency_overrides[get_current_principal]
+
+    def test_log_privacy(self):
+        import logging
+        import sys
+        from io import StringIO
+
+        log_stream = StringIO()
+        handler = logging.StreamHandler(log_stream)
+        logger = logging.getLogger()
+        logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.DEBUG)
+
+        stdout_stream = StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = stdout_stream
+
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        try:
+            ik = str(uuid.uuid4())
+            response = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik})
+            self.assertEqual(response.status_code, 200)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+            sys.stdout = old_stdout
+
+        logs = log_stream.getvalue()
+        prints = stdout_stream.getvalue()
+
+        self.assertNotIn("C1", logs, "Plaintext candidate_id found in logs!")
+        self.assertNotIn("Bob", logs, "Plaintext candidate name found in logs!")
+        self.assertNotIn("C1", prints, "Plaintext candidate_id found in prints!")
+        self.assertNotIn("Bob", prints, "Plaintext candidate name found in prints!")
 
     def test_admin_routes_forbidden_for_voter(self):
         def override_principal():
