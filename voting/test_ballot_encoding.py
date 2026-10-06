@@ -152,3 +152,13 @@ def test_no_voter_identity_or_ballot_values_logged(caplog):
     assert selected not in log_text
     assert result["encoded_bits"] not in log_text
     assert "1" not in log_text # Index of Bob is 1
+
+def test_prepare_circuit_invalid_1_state_one_choice():
+    with pytest.raises(ValueError) as excinfo:
+        prepare_circuit("1", choice_count=1)
+    assert "outside the valid range" in str(excinfo.value)
+
+def test_decode_choice_invalid_1_state_one_choice():
+    with pytest.raises(ValueError) as excinfo:
+        decode_choice(["OnlyChoice"], "1")
+    assert "outside the valid range" in str(excinfo.value)
