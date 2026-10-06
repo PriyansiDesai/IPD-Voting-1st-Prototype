@@ -139,19 +139,16 @@ def test_no_voter_information():
     expected_keys = {"encoding_version", "choice_count", "qubit_count", "encoded_bits"}
     assert set(result.keys()) == expected_keys
 
-def test_no_voter_identity_or_ballot_values_logged(caplog):
+def test_encode_choice_emits_no_logs(caplog):
     import logging
     caplog.set_level(logging.DEBUG)
 
     choices = ["Alice", "Bob", "Charlie"]
     selected = "Bob"
-    result = encode_choice(choices, selected)
+    encode_choice(choices, selected)
 
-    # ensure "Bob", "01" (the encoded bits), or "1" (the index) are not logged
-    log_text = caplog.text
-    assert selected not in log_text
-    assert result["encoded_bits"] not in log_text
-    assert "1" not in log_text # Index of Bob is 1
+    # ensure encode_choice emits no logs at all
+    assert len(caplog.records) == 0
 
 def test_prepare_circuit_invalid_1_state_one_choice():
     with pytest.raises(ValueError) as excinfo:
