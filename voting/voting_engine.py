@@ -39,7 +39,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from vol1_encoding import encode_vote
+from voting.ballot_encoding import encode_choice
 from vol2_bb84 import run_secure_bb84
 from vol3_pqc import encrypt_vote, decrypt_vote
 from vol4_blockchain import Blockchain, Block
@@ -542,9 +542,10 @@ class VotingEngine:
                 return {"status": "success", "message": "Idempotent response.", "receipt": existing_receipt}
 
             try:
-                # 3.1 Quantum Vote Encoding (vol1)
-                encoded_result = encode_vote(candidates=[choice], chosen_candidate=choice)
-                encoded_choice = encoded_result["decoded_candidate"]
+                # 3.1 Quantum Vote Encoding (M3-v1)
+                session_choices = self.repo.get_session_choices(session_id)
+                encoded_result = encode_choice(choice_ids=session_choices, selected_choice_id=choice)
+                encoded_bits = encoded_result["encoded_bits"]
 
                 # 3.2 BB84 Quantum Key Distribution (vol2) - M4 Security Gate
                 bb84_result = run_secure_bb84(min_key_length=256)
@@ -556,7 +557,7 @@ class VotingEngine:
                     raise BB84SecurityError("BB84 security check failed: undersized or invalid key.")
 
                 # 3.3 Post-Quantum Encryption (vol3)
-                ciphertext_bytes = encrypt_vote(vote_data=encoded_choice, bb84_key=bb84_key)
+                ciphertext_bytes = encrypt_vote(vote_data=encoded_bits, bb84_key=bb84_key)
                 ciphertext_hex = ciphertext_bytes.hex()
             except Exception as e:
                 # Since postgres handles the reservation state in a database transaction,
@@ -564,7 +565,7 @@ class VotingEngine:
                 raise VotingError(f"Cryptographic pipeline failed: {str(e)}")
 
             receipt = self.repo.finalize_vote(session_id, voter_id, reservation_token, ciphertext_hex)
-            return {"status": "success", "message": "Vote cast and recorded on PostgreSQL.", "receipt": receipt, "num_qubits": encoded_result.get("num_qubits")}
+            return {"status": "success", "message": "Vote cast and recorded on PostgreSQL.", "receipt": receipt, "num_qubits": encoded_result.get("qubit_count")}
 
         # ── Step 2: Atomic Reservation & Pre-Execution Validation ────────────
         with self._lock:
@@ -676,9 +677,9 @@ class VotingEngine:
 
         # ── Step 3: Expensive Security Pipeline (outside lock) ───────────────
         try:
-            # 3.1 Quantum Vote Encoding (vol1)
-            encoded_result = encode_vote(candidates=choices_pool, chosen_candidate=choice)
-            encoded_choice = encoded_result["decoded_candidate"]
+            # 3.1 Quantum Vote Encoding (M3-v1)
+            encoded_result = encode_choice(choice_ids=choices_pool, selected_choice_id=choice)
+            encoded_bits = encoded_result["encoded_bits"]
 
             # 3.2 BB84 Quantum Key Distribution (vol2) - M4 Security Gate
             bb84_result = run_secure_bb84(min_key_length=256)
@@ -691,7 +692,7 @@ class VotingEngine:
                 raise BB84SecurityError("BB84 security check failed: undersized or invalid key.")
 
             # 3.3 Post-Quantum Encryption (vol3)
-            ciphertext_bytes = encrypt_vote(vote_data=encoded_choice, bb84_key=bb84_key)
+            ciphertext_bytes = encrypt_vote(vote_data=encoded_bits, bb84_key=bb84_key)
             ciphertext_hex = ciphertext_bytes.hex()
 
         except Exception:
@@ -776,7 +777,7 @@ class VotingEngine:
             "message": "Vote accepted and securely recorded on blockchain.",
             "block_index": block.index,
             "block_hash": block.hash,
-            "num_qubits": encoded_result.get("num_qubits"),
+            "num_qubits": encoded_result.get("qubit_count"),
         }
 
     def _commit_vote_metadata(
@@ -871,7 +872,13 @@ class VotingEngine:
         except ValueError as ex:
             raise VotingError(f"Ciphertext in block {target_index} is not valid hex: {ex}")
 
-        decrypted_choice = decrypt_vote(ciphertext_bytes, bb84_key)
+        decrypted_bits = decrypt_vote(ciphertext_bytes, bb84_key)
+        from voting.ballot_encoding import decode_choice
+        session_choices = self.get_session_choices(sid)
+        try:
+            decrypted_choice = decode_choice(session_choices, decrypted_bits)
+        except Exception as e:
+            raise VotingError(f"Failed to decode ballot bits: {e}")
 
         if require_expected_choice and expected_choice is None:
             raise VotingError("expected_choice is required when require_expected_choice=True.")
