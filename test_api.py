@@ -247,6 +247,72 @@ class TestVotingAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertIn("not found", response.json()["detail"])
 
+    def test_m3_encoding_failure_reclaim(self):
+        """
+        Test that a vote failing during M3 encoding leaves participation PENDING,
+        and that a retry after 5 minutes successfully reclaims the reservation.
+        """
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        ik1 = str(uuid.uuid4())
+
+        # 1. First vote request (fails during encode_choice)
+        with patch('voting.voting_engine.encode_choice') as mock_encode_choice:
+            mock_encode_choice.side_effect = ValueError("Deterministic encoding exception")
+            res1 = client.post(
+                "/vote",
+                json={"session_id": "S1", "candidate_id": "C1"},
+                headers={"Idempotency-Key": ik1}
+            )
+            self.assertEqual(res1.status_code, 422)
+            self.assertIn("Cryptographic pipeline failed: Deterministic encoding exception", res1.json()["detail"])
+
+        # 2. Verify participation is PENDING and no ballot exists
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status FROM voter_participation WHERE session_id = 'S1' AND voter_id = 'V1'")
+                row = cur.fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row[0], 'PENDING')
+
+                cur.execute("SELECT COUNT(*) FROM ballots WHERE session_id = 'S1'")
+                count = cur.fetchone()[0]
+                self.assertEqual(count, 0)
+
+                # 3. Simulate 6 minutes passing by updating reserved_at
+                cur.execute("UPDATE voter_participation SET reserved_at = CURRENT_TIMESTAMP - INTERVAL '6 minutes' WHERE session_id = 'S1' AND voter_id = 'V1'")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+
+        # 4. Retry with a NEW Idempotency-Key (encoder is no longer mocked)
+        ik2 = str(uuid.uuid4())
+        res2 = client.post(
+            "/vote",
+            json={"session_id": "S1", "candidate_id": "C1"},
+            headers={"Idempotency-Key": ik2}
+        )
+
+        self.assertEqual(res2.status_code, 200)
+        self.assertEqual(res2.json()["status"], "success")
+
+        # 5. Verify participation is COMMITTED and exactly one ballot exists
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status FROM voter_participation WHERE session_id = 'S1' AND voter_id = 'V1'")
+                row = cur.fetchone()
+                self.assertEqual(row[0], 'COMMITTED')
+
+                cur.execute("SELECT COUNT(*) FROM ballots WHERE session_id = 'S1'")
+                count = cur.fetchone()[0]
+                self.assertEqual(count, 1)
+        finally:
+            self.repo.pool.putconn(conn)
+
     def test_ineligible_voter(self):
         def override_principal():
             return Principal(issuer="test-issuer", subject="test-subject-2")
