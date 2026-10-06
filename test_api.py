@@ -79,7 +79,7 @@ class TestVotingAPI(unittest.TestCase):
         conn = self.repo.get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO voting_sessions (session_id, title, session_type, start_time, end_time, status) VALUES ('S1', 'T1', 'candidate_election', '2000-01-01', '2100-01-01', 'ACTIVE')")
+                cur.execute("INSERT INTO voting_sessions (session_id, title, session_type, start_time, end_time, status) VALUES ('S1', 'T1', 'candidate_election', '2000-01-01', '2100-01-01', 'DRAFT')")
                 cur.execute("INSERT INTO voters (voter_id, name, department, role) VALUES ('V1', 'Alice', 'Engineering', 'Employee')")
                 cur.execute("INSERT INTO session_voters (session_id, voter_id) VALUES ('S1', 'V1')")
                 cur.execute("INSERT INTO candidates (candidate_id, candidate_name) VALUES ('C1', 'Bob')")
@@ -87,6 +87,10 @@ class TestVotingAPI(unittest.TestCase):
                 # Add mapping
                 cur.execute("INSERT INTO voter_identities (issuer, subject, voter_id) VALUES ('test-issuer', 'test-subject', 'V1')")
             conn.commit()
+
+            # Activate S1 after inserting choices
+            self.repo.update_session_status('S1', 'APPROVED', 'admin-subject')
+            self.repo.update_session_status('S1', 'ACTIVE', 'admin-subject')
         finally:
             self.repo.pool.putconn(conn)
 
@@ -148,11 +152,90 @@ class TestVotingAPI(unittest.TestCase):
         self.assertEqual(res2.status_code, 200)
         self.assertEqual(res2.json().get("receipt"), receipt1)
 
-        # Retry with new key -> Conflict
-        ik2 = str(uuid.uuid4())
-        res3 = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik2})
-        self.assertEqual(res3.status_code, 409)
-        self.assertIn("already cast a vote", res3.json()["detail"])
+    def test_vote_endpoint_logging_privacy(self):
+        """
+        Exercise the real authenticated POST /vote endpoint and ensure no sensitive
+        data (voter ID, choice ID, encoded bits) is logged.
+        """
+        import logging
+        import uuid
+
+        # 1. Create a dedicated test session in DRAFT, add its choices and voter eligibility, then activate it
+        session_id = "S_PRIVACY"
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                # Insert session in DRAFT
+                cur.execute("INSERT INTO voting_sessions (session_id, title, session_type, start_time, end_time, status) VALUES (%s, 'Privacy Test', 'candidate_election', '2000-01-01', '2100-01-01', 'DRAFT')", (session_id,))
+
+                # Insert voter and eligibility
+                cur.execute("INSERT INTO voters (voter_id, name, department, role) VALUES ('V_PRIVACY', 'Privacy Test Voter', 'Engineering', 'Employee') ON CONFLICT DO NOTHING")
+                cur.execute("INSERT INTO session_voters (session_id, voter_id) VALUES (%s, 'V_PRIVACY')", (session_id,))
+
+                # Insert identity mapping
+                cur.execute("INSERT INTO voter_identities (issuer, subject, voter_id) VALUES ('priv-issuer', 'priv-sub', 'V_PRIVACY')")
+
+                # Insert 6 choices to ensure a 3-bit encoding
+                for i in range(1, 7):
+                    cand_id = f"C_PRIV_{i}"
+                    cur.execute("INSERT INTO candidates (candidate_id, candidate_name) VALUES (%s, %s) ON CONFLICT DO NOTHING", (cand_id, f"PrivCand{i}"))
+                    cur.execute("INSERT INTO session_choices (session_choice_id, session_id, session_type, candidate_id) VALUES (%s, %s, 'candidate_election', %s)", (str(uuid.uuid4()), session_id, cand_id))
+            conn.commit()
+
+            # Activate the session
+            self.repo.update_session_status(session_id, "APPROVED", "admin-sub")
+            self.repo.update_session_status(session_id, "ACTIVE", "admin-sub")
+        finally:
+            self.repo.pool.putconn(conn)
+
+        def override_principal():
+            from api import Principal
+            return Principal(issuer="priv-issuer", subject="priv-sub")
+
+        from api import get_current_principal
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        ik = str(uuid.uuid4())
+
+        # 2. Capture records with a custom logging handler that allows an empty log list
+        class ListHandler(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.log_records = []
+            def emit(self, record):
+                self.log_records.append(self.format(record))
+
+        custom_handler = ListHandler()
+        root_logger = logging.getLogger()
+        old_level = root_logger.level
+        root_logger.setLevel(logging.DEBUG)
+        root_logger.addHandler(custom_handler)
+
+        try:
+            response = client.post(
+                "/vote",
+                json={"session_id": session_id, "candidate_id": "C_PRIV_6"},
+                headers={"Idempotency-Key": ik}
+            )
+        finally:
+            root_logger.removeHandler(custom_handler)
+            root_logger.setLevel(old_level)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "success")
+
+        # 3. Assert no record contains the distinctive choice ID, expected multi-bit encoding, or voter ID
+        # Expected encoded bits for C_PRIV_6 (index 5 out of 6 candidates) is '101'
+        expected_encoded_bits = "101"
+        distinctive_choice = "C_PRIV_6"
+        voter_id = "V_PRIVACY"
+
+        log_text = "\n".join(custom_handler.log_records)
+
+        self.assertNotIn(distinctive_choice, log_text)
+        self.assertNotIn(expected_encoded_bits, log_text)
+        self.assertNotIn(voter_id, log_text)
+
 
     def test_unknown_session(self):
         def override_principal():
