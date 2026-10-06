@@ -39,7 +39,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from voting.ballot_encoding import encode_choice
+from voting.ballot_encoding import encode_choice, prepare_circuit, M3State
 from vol2_bb84 import run_secure_bb84
 from vol3_pqc import encrypt_vote, decrypt_vote
 from vol4_blockchain import Blockchain, Block
@@ -545,7 +545,14 @@ class VotingEngine:
                 # 3.1 Quantum Vote Encoding (M3-v1)
                 session_choices = self.repo.get_session_choices(session_id)
                 encoded_result = encode_choice(choice_ids=session_choices, selected_choice_id=choice)
-                encoded_bits = encoded_result["encoded_bits"]
+                circuit = prepare_circuit(encoded_result["encoded_bits"], encoded_result["choice_count"])
+                m3_state = M3State(
+                    encoding_version=encoded_result["encoding_version"],
+                    choice_count=encoded_result["choice_count"],
+                    qubit_count=encoded_result["qubit_count"],
+                    encoded_bits=encoded_result["encoded_bits"],
+                    circuit=circuit
+                )
 
                 # 3.2 BB84 Quantum Key Distribution (vol2) - M4 Security Gate
                 bb84_result = run_secure_bb84(min_key_length=256)
@@ -557,7 +564,7 @@ class VotingEngine:
                     raise BB84SecurityError("BB84 security check failed: undersized or invalid key.")
 
                 # 3.3 Post-Quantum Encryption (vol3)
-                ciphertext_bytes = encrypt_vote(vote_data=encoded_bits, bb84_key=bb84_key)
+                ciphertext_bytes = encrypt_vote(vote_data=m3_state.encoded_bits, bb84_key=bb84_key)
                 ciphertext_hex = ciphertext_bytes.hex()
             except Exception as e:
                 # Since postgres handles the reservation state in a database transaction,
@@ -565,7 +572,7 @@ class VotingEngine:
                 raise VotingError(f"Cryptographic pipeline failed: {str(e)}")
 
             receipt = self.repo.finalize_vote(session_id, voter_id, reservation_token, ciphertext_hex)
-            return {"status": "success", "message": "Vote cast and recorded on PostgreSQL.", "receipt": receipt, "num_qubits": encoded_result.get("qubit_count")}
+            return {"status": "success", "message": "Vote cast and recorded on PostgreSQL.", "receipt": receipt, "num_qubits": m3_state.qubit_count}
 
         # ── Step 2: Atomic Reservation & Pre-Execution Validation ────────────
         with self._lock:
@@ -679,7 +686,14 @@ class VotingEngine:
         try:
             # 3.1 Quantum Vote Encoding (M3-v1)
             encoded_result = encode_choice(choice_ids=choices_pool, selected_choice_id=choice)
-            encoded_bits = encoded_result["encoded_bits"]
+            circuit = prepare_circuit(encoded_result["encoded_bits"], encoded_result["choice_count"])
+            m3_state = M3State(
+                encoding_version=encoded_result["encoding_version"],
+                choice_count=encoded_result["choice_count"],
+                qubit_count=encoded_result["qubit_count"],
+                encoded_bits=encoded_result["encoded_bits"],
+                circuit=circuit
+            )
 
             # 3.2 BB84 Quantum Key Distribution (vol2) - M4 Security Gate
             bb84_result = run_secure_bb84(min_key_length=256)
@@ -692,7 +706,7 @@ class VotingEngine:
                 raise BB84SecurityError("BB84 security check failed: undersized or invalid key.")
 
             # 3.3 Post-Quantum Encryption (vol3)
-            ciphertext_bytes = encrypt_vote(vote_data=encoded_bits, bb84_key=bb84_key)
+            ciphertext_bytes = encrypt_vote(vote_data=m3_state.encoded_bits, bb84_key=bb84_key)
             ciphertext_hex = ciphertext_bytes.hex()
 
         except Exception:
@@ -777,7 +791,7 @@ class VotingEngine:
             "message": "Vote accepted and securely recorded on blockchain.",
             "block_index": block.index,
             "block_hash": block.hash,
-            "num_qubits": encoded_result.get("qubit_count"),
+            "num_qubits": m3_state.qubit_count,
         }
 
     def _commit_vote_metadata(

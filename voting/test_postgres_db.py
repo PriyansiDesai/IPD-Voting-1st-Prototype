@@ -1123,5 +1123,76 @@ class TestPostgresVotingRepository(unittest.TestCase):
                 if "RETENTION_DATABASE_URL" in os.environ:
                     del os.environ["RETENTION_DATABASE_URL"]
 
+    def test_session_choice_freeze(self):
+        import uuid
+        import psycopg2
+        import datetime
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                # 1. Create unique test voter, candidate, session, and choice rows in a single database transaction.
+                cur.execute("SELECT CURRENT_TIMESTAMP")
+                now = cur.fetchone()[0]
+
+                voter_id = f"V_FRZ_{uuid.uuid4().hex[:8]}"
+                cur.execute("INSERT INTO voters (voter_id, name, department, role) VALUES (%s, 'FrzVoter', 'D', 'R')", (voter_id,))
+
+                c_id_1 = f"C_FRZ1_{uuid.uuid4().hex[:8]}"
+                c_id_2 = f"C_FRZ2_{uuid.uuid4().hex[:8]}"
+                cur.execute("INSERT INTO candidates (candidate_id, candidate_name) VALUES (%s, 'FrzCand1')", (c_id_1,))
+                cur.execute("INSERT INTO candidates (candidate_id, candidate_name) VALUES (%s, 'FrzCand2')", (c_id_2,))
+
+                start = now - datetime.timedelta(hours=1)
+                end = now + datetime.timedelta(hours=1)
+                s_id = f"S_FRZ_{uuid.uuid4().hex[:8]}"
+
+                cur.execute(
+                    "INSERT INTO voting_sessions (session_id, title, question, session_type, start_time, end_time, status) "
+                    "VALUES (%s, 'Frz Title', NULL, 'candidate_election', %s, %s, 'DRAFT')",
+                    (s_id, start, end)
+                )
+                cur.execute("INSERT INTO session_voters (session_id, voter_id) VALUES (%s, %s)", (s_id, voter_id))
+
+                choice_uuid_init = str(uuid.uuid4())
+                cur.execute("INSERT INTO session_choices (session_choice_id, session_id, session_type, candidate_id) VALUES (%s, %s, 'candidate_election', %s)", (choice_uuid_init, s_id, c_id_1))
+
+                # 2. In DRAFT, test a real choice change
+                choice_uuid_dyn = str(uuid.uuid4())
+                # Insert
+                cur.execute("INSERT INTO session_choices (session_choice_id, session_id, session_type, candidate_id) VALUES (%s, %s, 'candidate_election', %s)", (choice_uuid_dyn, s_id, c_id_1))
+                # Update candidate/option assignment to a different valid one
+                cur.execute("UPDATE session_choices SET candidate_id = %s WHERE session_choice_id = %s", (c_id_2, choice_uuid_dyn))
+                # Delete
+                cur.execute("DELETE FROM session_choices WHERE session_choice_id = %s", (choice_uuid_dyn,))
+
+                # 3. Set the session to ACTIVE within that same test transaction
+                cur.execute("UPDATE voting_sessions SET status = 'ACTIVE' WHERE session_id = %s", (s_id,))
+
+                # 4. Verify INSERT, UPDATE, and DELETE each raise the trigger exception using savepoints
+                choice_uuid_fail = str(uuid.uuid4())
+
+                cur.execute("SAVEPOINT sp_insert")
+                with self.assertRaises(psycopg2.errors.RaiseException) as ctx1:
+                    cur.execute("INSERT INTO session_choices (session_choice_id, session_id, session_type, candidate_id) VALUES (%s, %s, 'candidate_election', %s)", (choice_uuid_fail, s_id, c_id_1))
+                cur.execute("ROLLBACK TO SAVEPOINT sp_insert")
+                self.assertIn("Cannot modify choices for a session that is not in DRAFT status", str(ctx1.exception))
+
+                cur.execute("SAVEPOINT sp_update")
+                with self.assertRaises(psycopg2.errors.RaiseException) as ctx2:
+                    cur.execute("UPDATE session_choices SET candidate_id = %s WHERE session_choice_id = %s", (c_id_2, choice_uuid_init))
+                cur.execute("ROLLBACK TO SAVEPOINT sp_update")
+                self.assertIn("Cannot modify choices for a session that is not in DRAFT status", str(ctx2.exception))
+
+                cur.execute("SAVEPOINT sp_delete")
+                with self.assertRaises(psycopg2.errors.RaiseException) as ctx3:
+                    cur.execute("DELETE FROM session_choices WHERE session_choice_id = %s", (choice_uuid_init,))
+                cur.execute("ROLLBACK TO SAVEPOINT sp_delete")
+                self.assertIn("Cannot modify choices for a session that is not in DRAFT status", str(ctx3.exception))
+
+        finally:
+            # 5. Roll back the whole transaction in finally
+            conn.rollback()
+            self.repo.pool.putconn(conn)
+
 if __name__ == '__main__':
     unittest.main()

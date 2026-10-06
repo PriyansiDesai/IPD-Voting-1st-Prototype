@@ -1,5 +1,16 @@
 import math
 from typing import List, Dict, Any
+from dataclasses import dataclass
+
+@dataclass
+class M3State:
+    """Internal M3 representation combining encoding metadata with the prepared quantum circuit."""
+    encoding_version: str
+    choice_count: int
+    qubit_count: int
+    encoded_bits: str
+    circuit: 'qiskit.QuantumCircuit'
+
 
 def encode_choice(choice_ids: List[str], selected_choice_id: str) -> Dict[str, Any]:
     """
