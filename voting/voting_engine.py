@@ -545,6 +545,9 @@ class VotingEngine:
                 # 3.1 Quantum Vote Encoding (M3-v1)
                 session_choices = self.repo.get_session_choices(session_id)
                 encoded_result = encode_choice(choice_ids=session_choices, selected_choice_id=choice)
+
+                # Note: The Qiskit circuit is a simulated, prepared M3 artifact with no downstream consumer
+                # in the current pipeline; the encoded bits are the current handoff.
                 circuit = prepare_circuit(encoded_result["encoded_bits"], encoded_result["choice_count"])
                 m3_state = M3State(
                     encoding_version=encoded_result["encoding_version"],
@@ -686,6 +689,9 @@ class VotingEngine:
         try:
             # 3.1 Quantum Vote Encoding (M3-v1)
             encoded_result = encode_choice(choice_ids=choices_pool, selected_choice_id=choice)
+
+            # Note: The Qiskit circuit is a simulated, prepared M3 artifact with no downstream consumer
+            # in the current pipeline; the encoded bits are the current handoff.
             circuit = prepare_circuit(encoded_result["encoded_bits"], encoded_result["choice_count"])
             m3_state = M3State(
                 encoding_version=encoded_result["encoding_version"],
