@@ -159,3 +159,15 @@ def test_decode_choice_invalid_1_state_one_choice():
     with pytest.raises(ValueError) as excinfo:
         decode_choice(["OnlyChoice"], "1")
     assert "outside the valid range" in str(excinfo.value)
+
+@pytest.mark.parametrize("choices, selected, expected_choice_count, expected_qubit_count, expected_encoded_bits", [
+    (["C002", "C001", "C003"], "C003", 3, 2, "10"),
+    (["OPT-YES", "OPT-NO"], "OPT-YES", 2, 1, "1"),
+    (["DEC-REJECT", "DEC-ABSTAIN", "DEC-APPROVE"], "DEC-REJECT", 3, 2, "10"),
+])
+def test_encode_choice_generic_ids(choices, selected, expected_choice_count, expected_qubit_count, expected_encoded_bits):
+    result = encode_choice(choices, selected)
+    assert result["choice_count"] == expected_choice_count
+    assert result["qubit_count"] == expected_qubit_count
+    assert result["encoded_bits"] == expected_encoded_bits
+    assert result["encoding_version"] == "M3-v1"
