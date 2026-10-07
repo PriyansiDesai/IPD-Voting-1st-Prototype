@@ -16,11 +16,11 @@ IMPORTANT DISCLAIMERS:
    does NOT provide physical-layer hardware security guarantees.
 2. Model of Classical Channel (Unauthenticated):
    The classical channel between Aarav (Alice) and Diya (Bob) is modeled in software via
-   in-memory variable exchanges. Currently, only basis sifting uses the simulated authenticated
-   channel; later classical exchanges (reconciliation, confirmation tags, and Toeplitz seeds)
-   remain unauthenticated. In real-world QKD, all classical exchanges require information-theoretically
-   secure message authentication (such as Wegman-Carter MACs with pre-shared keys) to prevent
-   man-in-the-middle attacks.
+   in-memory variable exchanges. Currently, only basis sifting and parameter estimation use the
+   simulated authenticated channel; later classical exchanges (reconciliation, confirmation tags,
+   and Toeplitz seeds) remain unauthenticated. In real-world QKD, all classical exchanges require
+   information-theoretically secure message authentication (such as Wegman-Carter MACs with
+   pre-shared keys) to prevent man-in-the-middle attacks.
 3. Symmetric Cryptography vs. Post-Quantum:
    Downstream encryption (vol3) uses standard AES-128 via Fernet with HKDF-derived keys.
    This is symmetric cryptography, NOT post-quantum public-key cryptography (e.g., NIST ML-KEM).
@@ -684,8 +684,64 @@ def run_secure_bb84(
     sample_indices = sorted(rng.sample(x_indices, sample_size))
     sample_indices_set = set(sample_indices)
 
+    aarav_sample_bits = [sifted_aarav[idx] for idx in sample_indices]
+    diya_sample_bits = [sifted_diya[idx] for idx in sample_indices]
+
+    try:
+        # Authentic Parameter Estimation Exchange (Software simulation only)
+        # Does NOT provide physical-layer QKD security.
+        frame_a_pe = sim_alice.send_frame("parameter_estimation", {
+            "sample_indices": sample_indices,
+            "sample_bits": aarav_sample_bits
+        })
+        frame_b_pe = sim_bob.send_frame("parameter_estimation", {
+            "sample_indices": sample_indices, # Bob echoes indices for protocol symmetry
+            "sample_bits": diya_sample_bits
+        })
+
+        rx_aarav_pe = sim_bob.receive_frame(frame_a_pe)
+        rx_diya_pe = sim_alice.receive_frame(frame_b_pe)
+
+        # Verify both endpoints received the exactly agreed-upon sample indices
+        if rx_aarav_pe["sample_indices"] != sample_indices or rx_diya_pe["sample_indices"] != sample_indices:
+            raise ValueError("Mismatched sample indices received")
+
+        rx_aarav_bits = rx_aarav_pe["sample_bits"]
+        rx_diya_bits = rx_diya_pe["sample_bits"]
+
+        # Verify payload shapes and bit domains
+        if len(rx_aarav_bits) != sample_size or len(rx_diya_bits) != sample_size:
+            raise ValueError("Mismatched sample bits length")
+        if any(b not in (0, 1) for b in rx_aarav_bits) or any(b not in (0, 1) for b in rx_diya_bits):
+            raise ValueError("Malformed sample bits")
+
+    except Exception as e:
+        return {
+            "secure": False,
+            "aborted": True,
+            "qber": 0.0,
+            "sample_size": sample_size,
+            "error_count": 0,
+            "qber_threshold": qber_threshold,
+            "sifted_key_length": total_sifted,
+            "final_key": None,
+            "final_key_length": 0,
+            "eavesdrop": eavesdrop,
+            "sample_indices": sample_indices,
+            "remaining_indices": [],
+            "reconciliation_disclosed_bits": 0,
+            "keys_match": False,
+            "reason": "authentication_failed",
+        }
+
+    # In a real distributed protocol, both Alice and Bob independently calculate
+    # the QBER comparing their local bits to the verified received remote bits,
+    # and separately abort if the threshold is exceeded. In this centralized
+    # simulation, we functionally replicate this by calculating QBER once using
+    # Alice's verified received bits (rx_aarav_bits) against Bob's local bits
+    # (diya_sample_bits).
     error_count = sum(
-        1 for idx in sample_indices if sifted_aarav[idx] != sifted_diya[idx]
+        1 for i in range(sample_size) if rx_aarav_bits[i] != diya_sample_bits[i]
     )
     qber = error_count / sample_size
 

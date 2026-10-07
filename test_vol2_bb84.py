@@ -568,6 +568,123 @@ class TestVol2BB84SiftingAuthentication(unittest.TestCase):
         self.assertEqual(len(pad_indices), len(set(pad_indices)))
 
 
+class TestVol2BB84ParameterEstimationAuthentication(unittest.TestCase):
+    """Integration tests for the authenticated classical channel during parameter estimation."""
+
+    def test_pe_authentication_success(self):
+        """A valid run completes the authenticated parameter estimation exchange."""
+        res = run_secure_bb84(min_key_length=256, seed=42)
+        self.assertTrue(res["secure"])
+        self.assertFalse(res["aborted"])
+
+    def test_pe_authentication_tamper_aborts(self):
+        """Tampering with the parameter estimation frame payload causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            # Tamper with the frame payload if it's parameter estimation
+            if frame.get("msg_type") == "parameter_estimation":
+                # Invert the first bit of the sample
+                if len(frame["payload"]["sample_bits"]) > 0:
+                    frame["payload"]["sample_bits"][0] ^= 1
+            return original_receive(self_obj, frame)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_pe_validation_mismatched_indices(self):
+        """Mismatched sample indices correctly fail payload validation and abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "parameter_estimation" and self_obj.peer_id == "bob":
+                # Alice sends to Bob
+                payload = dict(payload)
+                payload["sample_indices"] = list(payload["sample_indices"])
+                if len(payload["sample_indices"]) > 0:
+                    payload["sample_indices"][0] ^= 9999
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_pe_validation_malformed_sample_bits(self):
+        """Malformed sample bits (not 0 or 1) fail validation and abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "parameter_estimation" and self_obj.peer_id == "alice":
+                # Bob sends to Alice
+                payload = dict(payload)
+                payload["sample_bits"] = list(payload["sample_bits"])
+                if len(payload["sample_bits"]) > 0:
+                    payload["sample_bits"][0] = 2 # invalid bit
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_pe_authentication_tamper_bob_to_alice_aborts(self):
+        """Tampering specifically with Bob's PE frame causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            # self_obj.peer_id is the peer of the endpoint receiving the frame.
+            # Alice receives from Bob, so self_obj.peer_id == "bob"
+            if frame.get("msg_type") == "parameter_estimation" and self_obj.peer_id == "bob":
+                if len(frame["payload"]["sample_bits"]) > 0:
+                    frame["payload"]["sample_bits"][0] ^= 1
+            return original_receive(self_obj, frame)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_pe_authentication_replay_aborts(self):
+        """Replaying a previously accepted parameter estimation frame causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            res = original_receive(self_obj, frame)
+
+            if frame.get("msg_type") == "parameter_estimation":
+                # Immediately replay the exact same frame to the same endpoint.
+                # This exercises the pad replay/sequence checks.
+                original_receive(self_obj, frame)
+
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+
 def run_all_tests():
     """CLI test runner executing legacy, finite-key bound, protocol, and M2 abort test suites."""
     loader = unittest.defaultTestLoader
@@ -577,6 +694,7 @@ def run_all_tests():
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84Protocol))
     suite.addTest(loader.loadTestsFromTestCase(TestM2BB84AbortIntegration))
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84SiftingAuthentication))
+    suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84ParameterEstimationAuthentication))
     runner = unittest.TextTestRunner(verbosity=2)
     return runner.run(suite)
 

@@ -1,6 +1,7 @@
 import os
 import unittest
 from unittest.mock import patch, MagicMock
+# pyrefly: ignore [missing-import]
 from fastapi.testclient import TestClient
 
 # Must mock env vars before importing provisioning_api
