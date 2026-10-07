@@ -356,6 +356,27 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertTrue(run2["secure"])
         self.assertNotEqual(run1["final_key"], run2["final_key"])
 
+    def test_max_rounds_limit_enforcement(self):
+        """Requests with max_rounds exceeding MAX_ROUNDS_LIMIT are rejected to bound frame budgets."""
+        # Test rejection above limit
+        res_exceeds = run_secure_bb84(min_key_length=256, eavesdrop=False, max_rounds=16)
+        self.assertTrue(res_exceeds["aborted"])
+        self.assertFalse(res_exceeds["secure"])
+        self.assertIsNone(res_exceeds["final_key"])
+        self.assertEqual(res_exceeds["reason"], "max_rounds_exceeds_limit")
+
+        # Test acceptance at or below limit (e.g., max_rounds=15 should pass)
+        res_at_limit = run_secure_bb84(min_key_length=256, eavesdrop=False, max_rounds=15, seed=42)
+        self.assertTrue(res_at_limit["secure"])
+        self.assertFalse(res_at_limit["aborted"])
+        self.assertEqual(len(res_at_limit["final_key"]), 256)
+
+        # Test acceptance with default max_rounds omitted
+        res_default = run_secure_bb84(min_key_length=256, eavesdrop=False, seed=42)
+        self.assertTrue(res_default["secure"])
+        self.assertFalse(res_default["aborted"])
+        self.assertEqual(len(res_default["final_key"]), 256)
+
 
 class TestM2BB84AbortIntegration(unittest.TestCase):
     """Integration tests verifying M2 fail-closed behavior on BB84 abort or key defects.

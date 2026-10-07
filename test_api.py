@@ -313,6 +313,91 @@ class TestVotingAPI(unittest.TestCase):
         finally:
             self.repo.pool.putconn(conn)
 
+    def test_m4_bb84_abort_reclaim(self):
+        """
+        Test that a vote failing during M4 BB84 (run_secure_bb84) returning an aborted result
+        leaves participation PENDING, and that no ballot is finalized. Also asserts that encrypt_vote
+        is not called. It then proves that a retry after 6 minutes successfully reclaims the reservation
+        and results in a COMMITTED state with exactly one ballot.
+        Note: The crypto mock is limited to the first failure to trigger the abort deterministically.
+        """
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        ik1 = str(uuid.uuid4())
+
+        # 1. First vote request (fails during run_secure_bb84)
+        with patch('voting.voting_engine.run_secure_bb84') as mock_bb84, \
+             patch('voting.voting_engine.encrypt_vote') as mock_encrypt:
+
+            mock_bb84.return_value = {"secure": False, "aborted": True, "reason": "Test Abort"}
+
+            res1 = client.post(
+                "/vote",
+                json={"session_id": "S1", "candidate_id": "C1"},
+                headers={"Idempotency-Key": ik1}
+            )
+            self.assertEqual(res1.status_code, 422)
+            self.assertIn("Cryptographic pipeline failed", res1.json()["detail"])
+            self.assertIn("Test Abort", res1.json()["detail"])
+
+            mock_encrypt.assert_not_called()
+
+        # 2. Verify participation is PENDING and no ballot exists
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status FROM voter_participation WHERE session_id = 'S1' AND voter_id = 'V1'")
+                row = cur.fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row[0], 'PENDING')
+
+                cur.execute("SELECT COUNT(*) FROM ballots WHERE session_id = 'S1'")
+                count = cur.fetchone()[0]
+                self.assertEqual(count, 0)
+
+                # 3. Simulate 6 minutes passing by updating reserved_at
+                cur.execute("UPDATE voter_participation SET reserved_at = CURRENT_TIMESTAMP - INTERVAL '6 minutes' WHERE session_id = 'S1' AND voter_id = 'V1'")
+            conn.commit()
+        finally:
+            self.repo.pool.putconn(conn)
+
+        # 4. Retry with a NEW Idempotency-Key (mock crypto for a deterministic successful retry)
+        ik2 = str(uuid.uuid4())
+        with patch('voting.voting_engine.run_secure_bb84') as mock_bb84_retry, \
+             patch('voting.voting_engine.encrypt_vote') as mock_encrypt_retry:
+
+            mock_bb84_retry.return_value = {
+                "secure": True,
+                "aborted": False,
+                "final_key": [1] * 256
+            }
+            mock_encrypt_retry.return_value = b"test_ciphertext"
+
+            res2 = client.post(
+                "/vote",
+                json={"session_id": "S1", "candidate_id": "C1"},
+                headers={"Idempotency-Key": ik2}
+            )
+
+        self.assertEqual(res2.status_code, 200)
+        self.assertEqual(res2.json()["status"], "success")
+
+        # 5. Verify participation is COMMITTED and exactly one ballot exists
+        conn = self.repo.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status FROM voter_participation WHERE session_id = 'S1' AND voter_id = 'V1'")
+                row = cur.fetchone()
+                self.assertEqual(row[0], 'COMMITTED')
+
+                cur.execute("SELECT COUNT(*) FROM ballots WHERE session_id = 'S1'")
+                count = cur.fetchone()[0]
+                self.assertEqual(count, 1)
+        finally:
+            self.repo.pool.putconn(conn)
+
     def test_ineligible_voter(self):
         def override_principal():
             return Principal(issuer="test-issuer", subject="test-subject-2")

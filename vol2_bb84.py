@@ -390,6 +390,20 @@ def reconcile_keys(
     return alice, bob, disclosed_bits, False
 
 
+# ── Constants for Conservative Frame-Budget Bounds ────────────────────────
+# Note: 4,700 frames is a conservative future framed-channel design estimate.
+# Assumptions: at most 15 rounds, batches capped at 4,000 bits, three
+# reconciliation passes with block sizes 32/32/48, and proposed future framing
+# that groups block parities. The current code sends no classical frames
+# (it performs these operations directly in memory), so this is a design
+# estimate, not an enforced frame counter.
+TARGET_SIFTED_BITS = 3200
+MAX_BATCH_SIZE = 4000
+MAX_ROUNDS_LIMIT = 15
+REC_NUM_PASSES = 3
+REC_BLOCK_SIZE = 32
+
+
 # ── M4 Secure BB84 Protocol Simulation ────────────────────────────────────────
 
 def run_secure_bb84(
@@ -402,7 +416,7 @@ def run_secure_bb84(
     eps_pa: float = 1e-10,
     eps_s: float = 1e-10,
     seed: int | None = None,
-    max_rounds: int = 15,
+    max_rounds: int = MAX_ROUNDS_LIMIT,
 ) -> dict[str, Any]:
     """
     Simulates a four-state prepare-and-measure BB84 protocol session with finite-key bounds:
@@ -455,6 +469,25 @@ def run_secure_bb84(
             "reason": "invalid_parameters",
         }
 
+    if max_rounds > MAX_ROUNDS_LIMIT:
+        return {
+            "secure": False,
+            "aborted": True,
+            "qber": 0.0,
+            "sample_size": 0,
+            "error_count": 0,
+            "qber_threshold": qber_threshold,
+            "sifted_key_length": 0,
+            "final_key": None,
+            "final_key_length": 0,
+            "eavesdrop": eavesdrop,
+            "sample_indices": [],
+            "remaining_indices": [],
+            "reconciliation_disclosed_bits": 0,
+            "keys_match": False,
+            "reason": "max_rounds_exceeds_limit",
+        }
+
     if seed is not None:
         rng = random.Random(seed)
     else:
@@ -463,8 +496,8 @@ def run_secure_bb84(
     simulator = AerSimulator()
 
     # To satisfy the Tomamichel et al. (2012) finite-key bound with Serfling parameter estimation
-    # and achieve ell >= 256 bits when using only the Z-basis for key, we target at least 3200 sifted bits.
-    target_sifted_needed = 3200
+    # and achieve ell >= 256 bits when using only the Z-basis for key, we target at least TARGET_SIFTED_BITS bits.
+    target_sifted_needed = TARGET_SIFTED_BITS
     chunk_size = 50
 
     sifted_aarav: list[int] = []
@@ -474,7 +507,7 @@ def run_secure_bb84(
     # ── Transmission & Sifting Loop ───────────────────────────────────────────
     for round_idx in range(max_rounds):
         needed_sifted = target_sifted_needed - len(sifted_aarav)
-        batch_size = max(500, min(4000, int(2.1 * needed_sifted)))
+        batch_size = max(500, min(MAX_BATCH_SIZE, int(2.1 * needed_sifted)))
 
         aarav_bits = [rng.randint(0, 1) for _ in range(batch_size)]
         aarav_bases = [rng.choice(['+', 'x']) for _ in range(batch_size)]
@@ -648,9 +681,9 @@ def run_secure_bb84(
     rec_aarav, rec_diya, leak_ec, rec_success = reconcile_keys(
         alice_bits=raw_aarav,
         bob_bits=raw_diya,
-        block_size=32,
+        block_size=REC_BLOCK_SIZE,
         tag_bits=tag_bits,
-        num_passes=3,
+        num_passes=REC_NUM_PASSES,
     )
 
     if not rec_success or rec_aarav != rec_diya:
