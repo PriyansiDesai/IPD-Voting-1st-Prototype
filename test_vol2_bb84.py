@@ -497,6 +497,77 @@ class TestM2BB84AbortIntegration(unittest.TestCase):
         self.assertIn((self.session_id, self.voter_id), self.engine._voted_voters)
 
 
+class TestVol2BB84SiftingAuthentication(unittest.TestCase):
+    """Integration tests for the authenticated classical channel during basis sifting."""
+
+    def test_sifting_authentication_success(self):
+        """A valid run completes the authenticated sifting exchange."""
+        res = run_secure_bb84(min_key_length=256, seed=42)
+        self.assertTrue(res["secure"])
+        self.assertFalse(res["aborted"])
+
+    def test_sifting_authentication_tamper_aborts(self):
+        """Tampering with the sifting frame payload causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            # Tamper with the frame payload
+            if frame.get("msg_type") == "basis_exchange":
+                frame["payload"]["bases"] = ['+'] * len(frame["payload"]["bases"])
+            return original_receive(self_obj, frame)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+
+    def test_sifting_authentication_replay_aborts(self):
+        """Replaying a previously accepted frame causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            # Process the frame normally first
+            res = original_receive(self_obj, frame)
+
+            # Immediately replay the exact same frame to the same endpoint.
+            # This exercises the pad replay/sequence checks, not the sender check.
+            # It will raise an AuthenticationError, which the caller catches to abort.
+            original_receive(self_obj, frame)
+
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_sifting_authentication_pads_unique(self):
+        """Verifies that all frames sent during basis sifting use unique pad indices."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        pad_indices = []
+        def mock_send(self_obj, msg_type, payload):
+            frame = original_send(self_obj, msg_type, payload)
+            pad_indices.append(frame["pad_idx"])
+            return frame
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertTrue(res["secure"])
+
+        self.assertGreater(len(pad_indices), 0)
+        self.assertEqual(len(pad_indices), len(set(pad_indices)))
+
+
 def run_all_tests():
     """CLI test runner executing legacy, finite-key bound, protocol, and M2 abort test suites."""
     loader = unittest.defaultTestLoader
@@ -505,6 +576,7 @@ def run_all_tests():
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84FiniteKeyBound))
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84Protocol))
     suite.addTest(loader.loadTestsFromTestCase(TestM2BB84AbortIntegration))
+    suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84SiftingAuthentication))
     runner = unittest.TextTestRunner(verbosity=2)
     return runner.run(suite)
 

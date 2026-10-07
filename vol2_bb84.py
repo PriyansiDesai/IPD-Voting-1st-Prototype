@@ -16,10 +16,11 @@ IMPORTANT DISCLAIMERS:
    does NOT provide physical-layer hardware security guarantees.
 2. Model of Classical Channel (Unauthenticated):
    The classical channel between Aarav (Alice) and Diya (Bob) is modeled in software via
-   in-memory variable exchanges. It is NOT cryptographically authenticated.
-   In real-world QKD, all classical exchanges (sifting, reconciliation, confirmation tags,
-   and Toeplitz seeds) require information-theoretically secure message authentication
-   (such as Wegman-Carter MACs with pre-shared keys) to prevent man-in-the-middle attacks.
+   in-memory variable exchanges. Currently, only basis sifting uses the simulated authenticated
+   channel; later classical exchanges (reconciliation, confirmation tags, and Toeplitz seeds)
+   remain unauthenticated. In real-world QKD, all classical exchanges require information-theoretically
+   secure message authentication (such as Wegman-Carter MACs with pre-shared keys) to prevent
+   man-in-the-middle attacks.
 3. Symmetric Cryptography vs. Post-Quantum:
    Downstream encryption (vol3) uses standard AES-128 via Fernet with HKDF-derived keys.
    This is symmetric cryptography, NOT post-quantum public-key cryptography (e.g., NIST ML-KEM).
@@ -597,11 +598,50 @@ def run_secure_bb84(
                 diya_results.extend(int(rev[c_len + q]) for q in range(c_len))
 
         # Sifting
+        try:
+            from voting.classical_channel import SynchronizedFrameAllocator, AuthenticatedChannelEndpoint, MAX_FRAMES
+
+            # Setup simulation-only channel if not already created for this run
+            if "sim_allocator" not in locals():
+                import os
+                auth_key_len = 16 + MAX_FRAMES * 16
+                # Centrally generated simulation material for educational purposes,
+                # NOT a deployed pre-shared secret.
+                sim_auth_key = os.urandom(auth_key_len)
+                sim_allocator = SynchronizedFrameAllocator(sim_auth_key)
+                sim_alice = AuthenticatedChannelEndpoint("sim-run", "alice", "bob", sim_allocator)
+                sim_bob = AuthenticatedChannelEndpoint("sim-run", "bob", "alice", sim_allocator)
+
+            # Authentic Basis Exchange
+            frame_a = sim_alice.send_frame("basis_exchange", {"bases": aarav_bases})
+            frame_b = sim_bob.send_frame("basis_exchange", {"bases": diya_bases})
+
+            rx_aarav_bases = sim_bob.receive_frame(frame_a)["bases"]
+            rx_diya_bases = sim_alice.receive_frame(frame_b)["bases"]
+        except Exception as e:
+            return {
+                "secure": False,
+                "aborted": True,
+                "qber": 0.0,
+                "sample_size": 0,
+                "error_count": 0,
+                "qber_threshold": qber_threshold,
+                "sifted_key_length": 0,
+                "final_key": None,
+                "final_key_length": 0,
+                "eavesdrop": eavesdrop,
+                "sample_indices": [],
+                "remaining_indices": [],
+                "reconciliation_disclosed_bits": 0,
+                "keys_match": False,
+                "reason": f"authentication_failed",
+            }
+
         for i in range(batch_size):
-            if aarav_bases[i] == diya_bases[i]:
+            if rx_aarav_bases[i] == rx_diya_bases[i]:
                 sifted_aarav.append(aarav_bits[i])
                 sifted_diya.append(diya_results[i])
-                sifted_bases.append(aarav_bases[i])
+                sifted_bases.append(rx_aarav_bases[i])
 
         if len(sifted_aarav) >= target_sifted_needed:
             break
