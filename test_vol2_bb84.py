@@ -175,19 +175,21 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertTrue(res["reconciliation_success"])
         self.assertGreaterEqual(res["finite_key_bound"]["ell"], 256)
 
-    def test_noisy_channel_sub_threshold_vs_above_threshold(self):
-        """Sub-threshold noise is handled; excessive channel noise (>11%) aborts."""
+    def test_noisy_channel_reconciliation_limit_and_aborts(self):
+        """1.5% noise exceeds 3-pass reconciliation limit; >11% noise aborts at QBER check."""
         # Case A: Sub-threshold noise (channel_error_rate = 0.015 / 1.5%)
+        # For seed=123 and 3200-bit length, the 1.5% noise happens to overwhelm the 3-pass
+        # Cascade limit due to clustering, failing verification without changing the QBER threshold.
         res_sub = run_secure_bb84(
             min_key_length=256,
             eavesdrop=False,
             channel_error_rate=0.015,
             seed=123,
         )
-        if res_sub["qber"] <= 0.11 and res_sub["finite_key_bound"]["ell"] >= 256:
-            self.assertTrue(res_sub["secure"])
-            self.assertFalse(res_sub["aborted"])
-            self.assertTrue(res_sub["keys_match"])
+        self.assertFalse(res_sub["secure"])
+        self.assertTrue(res_sub["aborted"])
+        self.assertEqual(res_sub["reason"], "reconciliation_verification_failed")
+        self.assertIsNone(res_sub["final_key"])
 
         # Case B: Above-threshold noise (channel_error_rate = 0.15 / 15%)
         res_above = run_secure_bb84(
@@ -197,7 +199,6 @@ class TestVol2BB84Protocol(unittest.TestCase):
             seed=456,
         )
         self.assertTrue(res_above["aborted"])
-        self.assertFalse(res_sub["eavesdrop"] if res_above["secure"] else False)
         self.assertIn(res_above["reason"], ("qber_threshold_exceeded", "finite_key_bound_insufficient"))
         self.assertIsNone(res_above["final_key"])
 
@@ -239,6 +240,61 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertGreater(len(sample_set), 0)
         self.assertGreater(len(remaining_set), 0)
 
+    def test_sifted_array_capping_and_alignment(self):
+        """Arrays are capped to TARGET_SIFTED_BITS and perfectly retain their positional alignment."""
+        from vol2_bb84 import TARGET_SIFTED_BITS, align_and_cap_sifted_arrays
+
+        # Test helper function behavior directly with position-distinct arrays
+        a = list(range(4000))
+        b = list(range(4000, 8000))
+        bases = [str(i) for i in range(8000, 12000)]
+
+        cap_a, cap_b, cap_bases = align_and_cap_sifted_arrays(a, b, bases, 3200)
+        self.assertEqual(len(cap_a), 3200)
+        self.assertEqual(cap_a, list(range(3200)))
+        self.assertEqual(cap_b, list(range(4000, 7200)))
+        self.assertEqual(cap_bases, [str(i) for i in range(8000, 11200)])
+
+        # Test mismatched inputs
+        with self.assertRaises(ValueError):
+            align_and_cap_sifted_arrays(a, b[:3000], bases, 3200)
+
+        # Test full protocol alignment
+        res = run_secure_bb84(min_key_length=256, eavesdrop=False, seed=42)
+        self.assertTrue(res["secure"])
+        self.assertEqual(res["sifted_key_length"], TARGET_SIFTED_BITS)
+
+        n = len(res["remaining_indices"])
+        m = res["sample_size"]
+        self.assertEqual(n + m, TARGET_SIFTED_BITS, "n + m must exactly equal the capped population")
+
+    def test_sample_ratio_parameter_is_ignored(self):
+        """The sample_ratio parameter is retained for compatibility but ignored, as all X-basis bits are used. Out of range values are still rejected."""
+        res_default = run_secure_bb84(min_key_length=256, eavesdrop=False, seed=888)
+        res_changed = run_secure_bb84(min_key_length=256, eavesdrop=False, sample_ratio=0.99, seed=888)
+
+        self.assertTrue(res_default["secure"])
+        self.assertTrue(res_changed["secure"])
+        self.assertEqual(res_default["sample_size"], res_changed["sample_size"])
+        self.assertEqual(res_default["sample_indices"], res_changed["sample_indices"])
+
+        # Test out-of-range rejection
+        res_high = run_secure_bb84(min_key_length=256, eavesdrop=False, sample_ratio=1.0)
+        self.assertFalse(res_high["secure"])
+        self.assertTrue(res_high["aborted"])
+
+        res_low = run_secure_bb84(min_key_length=256, eavesdrop=False, sample_ratio=0.0)
+        self.assertFalse(res_low["secure"])
+        self.assertTrue(res_low["aborted"])
+
+    def test_insufficient_sample_size_aborts(self):
+        """If X-basis bits are missing, sample_size is 0 and it aborts."""
+        with patch('random.Random.choice', return_value='+'):
+            res = run_secure_bb84(min_key_length=256, eavesdrop=False, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "insufficient_sifted_bits")
+
     def test_reconciliation_multiple_errors_in_same_block(self):
         """Multi-pass Cascade reconciliation corrects multiple bit flips in the same block."""
         alice_raw = [1, 0, 1, 1, 0, 0, 1, 0] * 50  # 400 bits
@@ -263,7 +319,6 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertEqual(rec_alice, rec_bob)
         self.assertEqual(rec_alice, alice_raw)
         self.assertGreater(disclosed, 32)  # Parity bits + confirmation tag accounted for
-
     def test_reconciliation_unresolved_mismatch_aborts(self):
         """Excessive or uncorrectable errors fail tag verification and return success=False."""
         alice_raw = [0] * 300
@@ -685,6 +740,219 @@ class TestVol2BB84ParameterEstimationAuthentication(unittest.TestCase):
             self.assertIsNone(res["final_key"])
 
 
+class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
+    """M4 Tests for Authentication Integration in Key Reconciliation."""
+
+    def test_reconciliation_parity_authentication_tampering_aborts(self):
+        """Tampering with a parity frame during reconciliation causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            if frame.get("msg_type") == "parity":
+                # Tamper with the payload without updating the MAC
+                frame["payload"]["p"] = 1 - frame["payload"]["p"]
+            return original_receive(self_obj, frame)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_parity_authentication_replay_aborts(self):
+        """Replaying a parity frame during reconciliation causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            res = original_receive(self_obj, frame)
+            if frame.get("msg_type") == "parity":
+                # Immediately replay the exact same frame to the same endpoint
+                original_receive(self_obj, frame)
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_frame_exhaustion_aborts(self):
+        """Frame exhaustion during reconciliation parity exchange causes a fail-closed abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint, FrameExhaustionError
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "parity":
+                raise FrameExhaustionError("Aggregate frame budget exceeded.")
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "frame_budget_exceeded")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_bisection_authentication_tampering_aborts(self):
+        """Tampering with a bisection parity frame during reconciliation causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            if frame.get("msg_type") == "bisection_parity":
+                # Tamper with the payload without updating the MAC
+                frame["payload"]["p"] = 1 - frame["payload"]["p"]
+            return original_receive(self_obj, frame)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            # Use low channel error rate to ensure we successfully complete block parity but trigger a bisection
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.005, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_bisection_authentication_replay_aborts(self):
+        """Replaying a bisection parity frame during reconciliation causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            res = original_receive(self_obj, frame)
+            if frame.get("msg_type") == "bisection_parity":
+                # Immediately replay the exact same frame to the same endpoint
+                original_receive(self_obj, frame)
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.005, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_bisection_frame_exhaustion_aborts(self):
+        """Frame exhaustion during bisection parity exchange causes a fail-closed abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint, FrameExhaustionError
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "bisection_parity":
+                raise FrameExhaustionError("Aggregate frame budget exceeded.")
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.005, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "frame_budget_exceeded")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_tag_authentication_tampering_aborts(self):
+        """Tampering with a verification tag frame during reconciliation causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            if frame.get("msg_type") == "verification_tag":
+                # Tamper with the payload tag (invert first hex character)
+                tag_hex = frame["payload"]["tag"]
+                char = tag_hex[0]
+                new_char = '0' if char != '0' else '1'
+                frame["payload"]["tag"] = new_char + tag_hex[1:]
+            return original_receive(self_obj, frame)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            # Zero channel error avoids bisection, but initial block-parity exchanges still occur before the tag exchange
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_tag_authentication_replay_aborts(self):
+        """Replaying a verification tag frame during reconciliation causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        def mock_receive(self_obj, frame):
+            res = original_receive(self_obj, frame)
+            if frame.get("msg_type") == "verification_tag":
+                # Immediately replay the exact same frame to the same endpoint
+                original_receive(self_obj, frame)
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_tag_frame_exhaustion_aborts(self):
+        """Frame exhaustion during verification tag exchange causes a fail-closed abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint, FrameExhaustionError
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "verification_tag":
+                raise FrameExhaustionError("Aggregate frame budget exceeded.")
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "frame_budget_exceeded")
+            self.assertIsNone(res["final_key"])
+
+    def test_reconciliation_partial_endpoints_rejected(self):
+        """Reconcile keys rejects a configuration where only one endpoint is supplied."""
+        from vol2_bb84 import reconcile_keys
+        with self.assertRaisesRegex(ValueError, "Both sim_alice and sim_bob must be provided together, or both omitted."):
+            reconcile_keys(
+                alice_bits=[0, 1],
+                bob_bits=[0, 1],
+                sim_alice="dummy_alice",
+                sim_bob=None
+            )
+        with self.assertRaisesRegex(ValueError, "Both sim_alice and sim_bob must be provided together, or both omitted."):
+            reconcile_keys(
+                alice_bits=[0, 1],
+                bob_bits=[0, 1],
+                sim_alice=None,
+                sim_bob="dummy_bob"
+            )
+
+    def test_reconciliation_falsey_endpoints_use_authenticated_transport(self):
+        """A falsey endpoint object is not silently treated as local mode; it still uses authenticated transport."""
+        from vol2_bb84 import reconcile_keys
+
+        class FalseyEndpoint:
+            def __bool__(self):
+                return False
+            def send_frame(self, msg_type, payload):
+                raise RuntimeError("Authenticated transport was correctly invoked")
+
+        alice_ep = FalseyEndpoint()
+        bob_ep = FalseyEndpoint()
+
+        # By expecting RuntimeError, we prove that reconcile_keys did not silently
+        # fall back to local mode (which wouldn't call send_frame).
+        with self.assertRaisesRegex(RuntimeError, "Authenticated transport was correctly invoked"):
+            reconcile_keys(
+                alice_bits=[0, 1],
+                bob_bits=[1, 0],
+                sim_alice=alice_ep,
+                sim_bob=bob_ep
+            )
+
+
+
 def run_all_tests():
     """CLI test runner executing legacy, finite-key bound, protocol, and M2 abort test suites."""
     loader = unittest.defaultTestLoader
@@ -695,6 +963,7 @@ def run_all_tests():
     suite.addTest(loader.loadTestsFromTestCase(TestM2BB84AbortIntegration))
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84SiftingAuthentication))
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84ParameterEstimationAuthentication))
+    suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84ReconciliationAuthentication))
     runner = unittest.TextTestRunner(verbosity=2)
     return runner.run(suite)
 

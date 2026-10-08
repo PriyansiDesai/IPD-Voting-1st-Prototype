@@ -77,6 +77,7 @@ import math
 import random
 import hashlib
 from typing import Any
+from voting.classical_channel import AuthenticationError, FrameExhaustionError
 
 # pyrefly: ignore[missing-import]
 from qiskit import QuantumCircuit
@@ -304,6 +305,8 @@ def reconcile_keys(
     block_size: int = 48,
     tag_bits: int = 32,
     num_passes: int = 3,
+    sim_alice: Any = None,
+    sim_bob: Any = None,
 ) -> tuple[list[int], list[int], int, bool]:
     """
     Models classical error reconciliation and verification between Alice and Bob
@@ -313,11 +316,17 @@ def reconcile_keys(
     Tracks every classical bit disclosed during parity exchanges and confirmation tags.
     Checks tag after each pass so clean channels terminate without unnecessary leakage.
 
-    Model Note: Classical channel messages are simulated locally; authentication is NOT implemented.
+    Model Note: Initial block-parity exchanges, bisection queries, and verification tags
+    are authenticated via the provided sim_alice/sim_bob endpoints.
     Limitation: The verification tag is constructed via truncated SHA-256. While practically
     unforgeable (random oracle heuristic), a strict information-theoretic composable bound
     would require an eps-almost 2-universal hash family (e.g., polynomial evaluation over GF(2^t)).
     Thus, eps_c = 2^-32 serves here as an educational estimate for the correctness bound.
+    Frame Budget (Estimate only): The conservative maximum Z-key input is 3,199 bits, giving at most
+    267 blocks across the three passes. This yields 534 initial-parity frames, plus at most 2,804
+    bisection frames (assuming worst-case bisection steps for all blocks), and up to 6 tag frames
+    across the three passes, for a maximum of 3,344 reconciliation frames. Including parameter
+    estimation and sifting, this fits securely within the 4,700-frame budget.
 
     Returns:
         (alice_reconciled, bob_reconciled, disclosed_bits, success)
@@ -326,6 +335,9 @@ def reconcile_keys(
     bob = list(bob_bits)
     n = len(alice)
     disclosed_bits = 0
+
+    if (sim_alice is None) != (sim_bob is None):
+        raise ValueError("Both sim_alice and sim_bob must be provided together, or both omitted.")
 
     if n == 0 or len(bob) != n:
         return alice, bob, 0, False
@@ -359,18 +371,47 @@ def reconcile_keys(
             if not blk_indices:
                 continue
 
-            p_alice = sum(alice[i] for i in blk_indices) % 2
-            p_bob = sum(bob[i] for i in blk_indices) % 2
+            p_alice_local = sum(alice[i] for i in blk_indices) % 2
+            p_bob_local = sum(bob[i] for i in blk_indices) % 2
             disclosed_bits += 1
+
+            if sim_alice is not None and sim_bob is not None:
+                # Authenticated exchange for initial block parity
+                frame_a = sim_alice.send_frame("parity", {"p": p_alice_local})
+                frame_b = sim_bob.send_frame("parity", {"p": p_bob_local})
+
+                # Receive frames (will raise ValueError on tamper)
+                rx_a = sim_bob.receive_frame(frame_a)
+                rx_b = sim_alice.receive_frame(frame_b)
+
+                p_alice = rx_a["p"]
+                p_bob = rx_b["p"]
+            else:
+                p_alice = p_alice_local
+                p_bob = p_bob_local
 
             if p_alice != p_bob:
                 lo, hi = 0, len(blk_indices)
                 while (hi - lo) > 1:
                     mid = (lo + hi) // 2
                     left_indices = blk_indices[lo:mid]
-                    p_a_left = sum(alice[i] for i in left_indices) % 2
-                    p_b_left = sum(bob[i] for i in left_indices) % 2
+                    p_a_left_local = sum(alice[i] for i in left_indices) % 2
+                    p_b_left_local = sum(bob[i] for i in left_indices) % 2
                     disclosed_bits += 1
+
+                    if sim_alice is not None and sim_bob is not None:
+                        # Authenticated exchange for bisection parity
+                        frame_a = sim_alice.send_frame("bisection_parity", {"p": p_a_left_local})
+                        frame_b = sim_bob.send_frame("bisection_parity", {"p": p_b_left_local})
+
+                        rx_a = sim_bob.receive_frame(frame_a)
+                        rx_b = sim_alice.receive_frame(frame_b)
+
+                        p_a_left = rx_a["p"]
+                        p_b_left = rx_b["p"]
+                    else:
+                        p_a_left = p_a_left_local
+                        p_b_left = p_b_left_local
 
                     if p_a_left != p_b_left:
                         hi = mid
@@ -381,9 +422,23 @@ def reconcile_keys(
                 bob[err_idx] = 1 - bob[err_idx]
 
         # Verification / Confirmation tag check after this pass
-        alice_tag = _compute_tag(alice)
-        bob_tag = _compute_tag(bob)
+        alice_tag_local = _compute_tag(alice)
+        bob_tag_local = _compute_tag(bob)
         disclosed_bits += tag_bits
+
+        if sim_alice is not None and sim_bob is not None:
+            # Authenticated exchange for verification tag
+            frame_a = sim_alice.send_frame("verification_tag", {"tag": alice_tag_local.hex()})
+            frame_b = sim_bob.send_frame("verification_tag", {"tag": bob_tag_local.hex()})
+
+            rx_a = sim_bob.receive_frame(frame_a)
+            rx_b = sim_alice.receive_frame(frame_b)
+
+            alice_tag = bytes.fromhex(rx_a["tag"])
+            bob_tag = bytes.fromhex(rx_b["tag"])
+        else:
+            alice_tag = alice_tag_local
+            bob_tag = bob_tag_local
 
         if alice_tag == bob_tag and alice == bob:
             return alice, bob, disclosed_bits, True
@@ -404,6 +459,12 @@ MAX_ROUNDS_LIMIT = 15
 REC_NUM_PASSES = 3
 REC_BLOCK_SIZE = 32
 
+def align_and_cap_sifted_arrays(
+    sifted_a: list[int], sifted_b: list[int], bases: list[str], limit: int
+) -> tuple[list[int], list[int], list[str]]:
+    if not (len(sifted_a) == len(sifted_b) == len(bases)):
+        raise ValueError("Mismatched input lengths for sifted arrays.")
+    return sifted_a[:limit], sifted_b[:limit], bases[:limit]
 
 # ── M4 Secure BB84 Protocol Simulation ────────────────────────────────────────
 
@@ -423,7 +484,9 @@ def run_secure_bb84(
     Simulates a four-state prepare-and-measure BB84 protocol session with finite-key bounds:
     1. Multi-round quantum transmission with basis sifting (chunked for fast execution).
     2. Optional channel error noise and intercept-resend eavesdropping.
-    3. Random sample selection for QBER estimation; sample bits strictly excluded from key.
+    3. Parameter estimation uses ALL X-basis bits. The sample_ratio parameter is
+       retained for compatibility and validated to be in (0, 1), but its value
+       does not control the sampling size.
     4. Threshold verification (aborts if QBER > qber_threshold).
     5. Multi-pass key reconciliation with exact classical leakage tracking and tag confirmation.
     6. Published finite-key bound calculation (Tomamichel et al. 2012) bounding phase error
@@ -646,6 +709,9 @@ def run_secure_bb84(
         if len(sifted_aarav) >= target_sifted_needed:
             break
 
+    sifted_aarav, sifted_diya, sifted_bases = align_and_cap_sifted_arrays(
+        sifted_aarav, sifted_diya, sifted_bases, TARGET_SIFTED_BITS
+    )
     total_sifted = len(sifted_aarav)
 
     # ── Basis-Specific Parameter Estimation (Tomamichel et al. 2012) ──────────
@@ -657,8 +723,7 @@ def run_secure_bb84(
     z_indices = [i for i, b in enumerate(sifted_bases) if b == '+']
     x_indices = [i for i, b in enumerate(sifted_bases) if b == 'x']
 
-    target_sample_size = int(round(total_sifted * sample_ratio))
-    sample_size = min(len(x_indices), target_sample_size)
+    sample_size = len(x_indices)
     remaining_count = len(z_indices)
 
     if remaining_count < min_key_length or sample_size == 0:
@@ -774,13 +839,52 @@ def run_secure_bb84(
     tag_bits = 32
     eps_c = 2 ** (-tag_bits)
 
-    rec_aarav, rec_diya, leak_ec, rec_success = reconcile_keys(
-        alice_bits=raw_aarav,
-        bob_bits=raw_diya,
-        block_size=REC_BLOCK_SIZE,
-        tag_bits=tag_bits,
-        num_passes=REC_NUM_PASSES,
-    )
+    try:
+        rec_aarav, rec_diya, leak_ec, rec_success = reconcile_keys(
+            alice_bits=raw_aarav,
+            bob_bits=raw_diya,
+            block_size=REC_BLOCK_SIZE,
+            tag_bits=tag_bits,
+            num_passes=REC_NUM_PASSES,
+            sim_alice=sim_alice,
+            sim_bob=sim_bob,
+        )
+    except AuthenticationError:
+        return {
+            "secure": False,
+            "aborted": True,
+            "qber": qber,
+            "sample_size": sample_size,
+            "error_count": error_count,
+            "qber_threshold": qber_threshold,
+            "sifted_key_length": total_sifted,
+            "final_key": None,
+            "final_key_length": 0,
+            "eavesdrop": eavesdrop,
+            "sample_indices": sample_indices,
+            "remaining_indices": remaining_indices,
+            "reconciliation_disclosed_bits": 0,
+            "keys_match": False,
+            "reason": "authentication_failed",
+        }
+    except FrameExhaustionError:
+        return {
+            "secure": False,
+            "aborted": True,
+            "qber": qber,
+            "sample_size": sample_size,
+            "error_count": error_count,
+            "qber_threshold": qber_threshold,
+            "sifted_key_length": total_sifted,
+            "final_key": None,
+            "final_key_length": 0,
+            "eavesdrop": eavesdrop,
+            "sample_indices": sample_indices,
+            "remaining_indices": remaining_indices,
+            "reconciliation_disclosed_bits": 0,
+            "keys_match": False,
+            "reason": "frame_budget_exceeded",
+        }
 
     if not rec_success or rec_aarav != rec_diya:
         return {
