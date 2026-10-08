@@ -186,32 +186,112 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertTrue(res["reconciliation_success"])
         self.assertGreaterEqual(res["finite_key_bound"]["ell"], 256)
 
-    def test_noisy_channel_reconciliation_limit_and_aborts(self):
-        """1.5% noise exceeds 3-pass reconciliation limit; >11% noise aborts at QBER check."""
-        # Case A: Sub-threshold noise (channel_error_rate = 0.015 / 1.5%)
-        # For seed=123 and 3200-bit length, the 1.5% noise happens to overwhelm the 3-pass
-        # Cascade limit due to clustering, failing verification without changing the QBER threshold.
-        res_sub = run_secure_bb84(
+    def test_low_noise_successful_reconciliation(self):
+        """1.5% noise is fully corrected by 3-pass Cascade with revisits."""
+        res = run_secure_bb84(
             min_key_length=256,
             eavesdrop=False,
             channel_error_rate=0.015,
             seed=123,
         )
-        self.assertFalse(res_sub["secure"])
-        self.assertTrue(res_sub["aborted"])
-        self.assertEqual(res_sub["reason"], "reconciliation_verification_failed")
-        self.assertIsNone(res_sub["final_key"])
+        # Reconciliation succeeds, though the leakage causes finite_key_bound_insufficient
+        self.assertTrue(res.get("keys_match", False))
+        self.assertEqual(res["reason"], "finite_key_bound_insufficient")
+        self.assertIsNone(res["final_key"])
 
-        # Case B: Above-threshold noise (channel_error_rate = 0.15 / 15%)
-        res_above = run_secure_bb84(
+    def test_unresolved_reconciliation_failure(self):
+        """Noise just below QBER threshold (e.g. 10%) exhausts the revisit limit and fails tag verification."""
+        res = run_secure_bb84(
+            min_key_length=256,
+            eavesdrop=False,
+            channel_error_rate=0.10,
+            seed=123,
+        )
+        self.assertLess(res["qber"], 0.11)
+        self.assertFalse(res["secure"])
+        self.assertTrue(res["aborted"])
+        self.assertEqual(res["reason"], "reconciliation_verification_failed")
+        self.assertIsNone(res["final_key"])
+
+    def test_high_noise_qber_aborts(self):
+        """Above-threshold noise (>11%) aborts at QBER check."""
+        res = run_secure_bb84(
             min_key_length=256,
             eavesdrop=False,
             channel_error_rate=0.15,
             seed=456,
         )
-        self.assertTrue(res_above["aborted"])
-        self.assertIn(res_above["reason"], ("qber_threshold_exceeded", "finite_key_bound_insufficient"))
-        self.assertIsNone(res_above["final_key"])
+        self.assertFalse(res["secure"])
+        self.assertTrue(res["aborted"])
+        self.assertEqual(res["reason"], "qber_threshold_exceeded")
+        self.assertIsNone(res["final_key"])
+    def test_reconciliation_revisit_exchange(self):
+        """Reconciliation revisit logic successfully catches and resolves an error, sending revisit_parity."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        import vol2_bb84
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        revisit_sent = False
+
+        def mock_send(self_obj, msg_type, payload):
+            nonlocal revisit_sent
+            if msg_type == "revisit_parity":
+                revisit_sent = True
+            return original_send(self_obj, msg_type, payload)
+
+        with unittest.mock.patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = vol2_bb84.run_secure_bb84(
+                min_key_length=256,
+                eavesdrop=False,
+                channel_error_rate=0.015,
+                seed=123,
+            )
+
+        self.assertTrue(res.get("keys_match", False))
+        self.assertTrue(revisit_sent, "revisit_parity frame was not sent during reconciliation")
+
+    def test_reconciliation_frame_budget_mathematics(self):
+        """Mathematical worst-case frame budget remains within the 4,700 limit."""
+        import math
+        from voting.classical_channel import MAX_FRAMES
+
+        max_sifted_bits = 3199
+        block_sizes = [32, 32, 48]
+        max_revisits = 50
+        max_rounds = 15
+
+        # 1. Initial parity exchanges (1 pair per block)
+        total_blocks = sum(math.ceil(max_sifted_bits / bs) for bs in block_sizes)
+        parity_frames = total_blocks * 2
+
+        # 2. Main-pass bisections (max 1 error per block)
+        bisection_frames = 0
+        for bs in block_sizes:
+            blocks_in_pass = math.ceil(max_sifted_bits / bs)
+            depth = math.ceil(math.log2(bs))
+            bisection_frames += blocks_in_pass * depth * 2
+
+        # 3. Revisits (parity pair + bisection pairs up to max depth)
+        max_depth = math.ceil(math.log2(max(block_sizes)))
+        revisit_frames = max_revisits * (2 + max_depth * 2)
+
+        # 4. Verification tags (1 pair per pass)
+        verification_tag_frames = len(block_sizes) * 2
+
+        # 5. Basis exchange rounds
+        basis_frames = max_rounds * 2
+
+        # 6. Parameter estimation
+        pe_frames = 2
+
+        # 7. PA / confirmation frames (PA1 seed, conf tag, PA2 seed)
+        pa_conf_frames = 6
+
+        total_frames = parity_frames + bisection_frames + revisit_frames + verification_tag_frames + basis_frames + pe_frames + pa_conf_frames
+
+        self.assertEqual(total_frames, 4082, "Calculated bound should precisely match the documented 4082 estimate.")
+        self.assertLessEqual(total_frames, MAX_FRAMES,
+                             f"Worst case {total_frames} frames exceeds MAX_FRAMES {MAX_FRAMES}")
 
     def test_eavesdrop_intercept_resend_aborts(self):
         """Intercept-resend eavesdropping induces ~25% QBER and reliably aborts."""
@@ -536,7 +616,7 @@ class TestM2BB84AbortIntegration(unittest.TestCase):
             [1, 2, 0] * 86,    # Integers other than 0 or 1
             [True, False] * 128, # Booleans should be rejected
         ]
-        
+
         for bad_key in malformed_keys:
             malformed_result = {
                 "secure": True,
@@ -977,14 +1057,14 @@ class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
         """A valid Toeplitz seed exchange succeeds and both sides use the identical seed."""
         from vol2_bb84 import run_secure_bb84
         from voting.classical_channel import AuthenticatedChannelEndpoint
-        
+
         captured_seed = {}
         original_send = AuthenticatedChannelEndpoint.send_frame
         def mock_send(self_obj, msg_type, payload):
             if msg_type == "toeplitz_seed":
                 captured_seed["alice"] = payload["seed"]
             return original_send(self_obj, msg_type, payload)
-            
+
         original_receive = AuthenticatedChannelEndpoint.receive_frame
         def mock_receive(self_obj, frame):
             res = original_receive(self_obj, frame)
@@ -1006,7 +1086,7 @@ class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint
         from vol2_bb84 import run_secure_bb84
         original_receive = AuthenticatedChannelEndpoint.receive_frame
-        
+
         def mock_receive(self_obj, frame):
             if frame.get("msg_type") == "toeplitz_seed":
                 # Invert first bit
@@ -1026,7 +1106,7 @@ class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint
         from vol2_bb84 import run_secure_bb84
         original_receive = AuthenticatedChannelEndpoint.receive_frame
-        
+
         def mock_receive(self_obj, frame):
             res = original_receive(self_obj, frame)
             if frame.get("msg_type") == "toeplitz_seed":
@@ -1045,7 +1125,7 @@ class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint, FrameExhaustionError
         from vol2_bb84 import run_secure_bb84
         original_send = AuthenticatedChannelEndpoint.send_frame
-        
+
         def mock_send(self_obj, msg_type, payload):
             if msg_type == "toeplitz_seed":
                 raise FrameExhaustionError("Frame budget exceeded")
@@ -1107,10 +1187,10 @@ class TestVol2BB84KeyConfirmationAuthentication(unittest.TestCase):
         """Mismatched intermediate keys trigger 'mismatch' ack and safe abort."""
         import vol2_bb84
         from vol2_bb84 import run_secure_bb84
-        
+
         original_hash = vol2_bb84.toeplitz_hash
         call_count = 0
-        
+
         def mock_hash(*args):
             nonlocal call_count
             res = original_hash(*args)
@@ -1131,7 +1211,7 @@ class TestVol2BB84KeyConfirmationAuthentication(unittest.TestCase):
         """Invalid ack payload triggers authentication_failed abort."""
         from voting.classical_channel import AuthenticatedChannelEndpoint
         from vol2_bb84 import run_secure_bb84
-        
+
         original_send = AuthenticatedChannelEndpoint.send_frame
         def mock_send(self_obj, msg_type, payload):
             if msg_type == "key_confirmation_ack":
@@ -1149,7 +1229,7 @@ class TestVol2BB84KeyConfirmationAuthentication(unittest.TestCase):
         """Replayed confirmation frame triggers authentication abort."""
         from voting.classical_channel import AuthenticatedChannelEndpoint
         from vol2_bb84 import run_secure_bb84
-        
+
         original_receive = AuthenticatedChannelEndpoint.receive_frame
         def mock_receive(self_obj, frame):
             res = original_receive(self_obj, frame)
@@ -1168,7 +1248,7 @@ class TestVol2BB84KeyConfirmationAuthentication(unittest.TestCase):
         """Frame exhaustion during confirmation fails safely."""
         from voting.classical_channel import AuthenticatedChannelEndpoint, FrameExhaustionError
         from vol2_bb84 import run_secure_bb84
-        
+
         original_send = AuthenticatedChannelEndpoint.send_frame
         def mock_send(self_obj, msg_type, payload):
             if msg_type == "key_confirmation":
@@ -1185,7 +1265,7 @@ class TestVol2BB84KeyConfirmationAuthentication(unittest.TestCase):
     def test_insufficient_ell_max(self):
         """Abort if ell_max is below required first-output length."""
         from vol2_bb84 import run_secure_bb84, compute_finite_key_bound
-        
+
         # We need to simulate a case where ell_max < first_pa_output_length
         original_compute = compute_finite_key_bound
         def mock_compute(*args, **kwargs):

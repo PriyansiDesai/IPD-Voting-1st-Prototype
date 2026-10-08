@@ -14,11 +14,11 @@ IMPORTANT DISCLAIMERS:
    All quantum states and measurements are executed via local circuit simulation (Qiskit Aer).
    This does NOT operate over physical optical fibers or free-space quantum channels and
    does NOT provide physical-layer hardware security guarantees.
-2. Model of Classical Channel (Unauthenticated):
+2. Model of Classical Channel (Authenticated):
    The classical channel between Aarav (Alice) and Diya (Bob) is modeled in software via
-   in-memory variable exchanges. Currently, only basis sifting and parameter estimation use the
-   simulated authenticated channel; later classical exchanges (reconciliation, confirmation tags,
-   and Toeplitz seeds) remain unauthenticated. In real-world QKD, all classical exchanges require
+   in-memory variable exchanges. Basis sifting, parameter estimation, multi-pass error reconciliation,
+   final-key confirmation tags, and Toeplitz PA seeds ALL use the simulated authenticated channel.
+   In real-world QKD, all classical exchanges require
    information-theoretically secure message authentication (such as Wegman-Carter MACs with
    pre-shared keys) to prevent man-in-the-middle attacks.
 3. Symmetric Cryptography vs. Post-Quantum:
@@ -239,7 +239,7 @@ def compute_finite_key_bound(
 
     # Composable secrecy parameter includes first extraction and second extraction (if any)
     eps_sec = eps_pe + 2.0 * eps_s + eps_pa + 2.0 * eps_s2 + eps_pa2
-    
+
     # Combined total error (secrecy + correctness)
     eps_total = eps_sec + eps_c
 
@@ -323,22 +323,23 @@ def reconcile_keys(
     Models classical error reconciliation and verification between Alice and Bob
     using multi-pass block parity with bisection and deterministic permutations (Cascade style).
 
-    Handles multiple errors occurring in the same block across successive permutation passes.
+    Handles multiple errors occurring in the same block across successive permutation passes
+    by queuing and revisiting earlier blocks that become unbalanced when an error is corrected.
     Tracks every classical bit disclosed during parity exchanges and confirmation tags.
     Checks tag after each pass so clean channels terminate without unnecessary leakage.
 
-    Model Note: Initial block-parity exchanges, bisection queries, and verification tags
-    are authenticated via the provided sim_alice/sim_bob endpoints.
+    Model Note: Initial block-parity exchanges, bisection queries, verification tags,
+    and revisit parities/bisections are authenticated via the provided sim_alice/sim_bob endpoints.
     Limitation: The verification tag is constructed via truncated SHA-256. While practically
     unforgeable (random oracle heuristic), a strict information-theoretic composable bound
     would require an eps-almost 2-universal hash family (e.g., polynomial evaluation over GF(2^t)).
     Thus, eps_c = 2^-32 serves here as an educational estimate for the correctness bound.
     Frame Budget (Estimate only): The conservative maximum Z-key input is 3,199 bits, giving at most
-    267 blocks across the three passes. This yields 534 initial-parity frames, plus at most 2,804
-    bisection frames (assuming worst-case bisection steps for all blocks), and up to 6 tag frames
-    across the three passes, for a maximum of 3,344 reconciliation frames. Including parameter
+    267 blocks across the three passes. This yields 534 initial-parity frames, plus bisections
+    and a bounded revisit queue (capped at 50 revisits, each up to 6 bisections + 1 parity, ~700 frames),
+    and up to 6 tag frames across the three passes, for a maximum of ~4,044 reconciliation frames. Including parameter
     estimation, sifting, the first PA seed exchange (2 frames), final key confirmation (2 frames),
-    and the second PA seed exchange (2 frames), the projected total is 3,382 frames.
+    and the second PA seed exchange (2 frames), the projected total is ~4,082 frames, well within the 4,700 limit.
 
     Returns:
         (alice_reconciled, bob_reconciled, disclosed_bits, success)
@@ -366,6 +367,38 @@ def reconcile_keys(
             byte_arr.append(val)
         return hashlib.sha256(byte_arr).digest()[:tag_bytes_len]
 
+    def _bisect_block(blk: list[int]) -> int:
+        nonlocal disclosed_bits
+        lo, hi = 0, len(blk)
+        while (hi - lo) > 1:
+            mid = (lo + hi) // 2
+            left_indices = blk[lo:mid]
+            p_a_left_local = sum(alice[i] for i in left_indices) % 2
+            p_b_left_local = sum(bob[i] for i in left_indices) % 2
+            disclosed_bits += 1
+
+            if sim_alice is not None and sim_bob is not None:
+                frame_a = sim_alice.send_frame("bisection_parity", {"p": p_a_left_local})
+                frame_b = sim_bob.send_frame("bisection_parity", {"p": p_b_left_local})
+                rx_a = sim_bob.receive_frame(frame_a)
+                rx_b = sim_alice.receive_frame(frame_b)
+                p_a_left = rx_a["p"]
+                p_b_left = rx_b["p"]
+            else:
+                p_a_left = p_a_left_local
+                p_b_left = p_b_left_local
+
+            if p_a_left != p_b_left:
+                hi = mid
+            else:
+                lo = mid
+
+        err_idx = blk[lo]
+        bob[err_idx] = 1 - bob[err_idx]
+        return err_idx
+
+    # Pre-generate blocks for all passes
+    blocks_by_pass = []
     for pass_idx in range(num_passes):
         if pass_idx == 0:
             indices = list(range(n))
@@ -377,61 +410,80 @@ def reconcile_keys(
             indices = rng_perm.sample(range(n), n)
             b_size = int(block_size * 1.5)
 
+        pass_blocks = []
         num_blocks = (n + b_size - 1) // b_size
         for b in range(num_blocks):
-            blk_indices = indices[b * b_size : min(n, (b + 1) * b_size)]
-            if not blk_indices:
-                continue
+            blk = indices[b * b_size : min(n, (b + 1) * b_size)]
+            if blk:
+                pass_blocks.append(blk)
+        blocks_by_pass.append(pass_blocks)
 
+    revisit_queue = []
+    revisit_budget = 50
+
+    def queue_revisits(err_idx: int, up_to_pass: int):
+        for prev_p in range(up_to_pass):
+            for prev_blk in blocks_by_pass[prev_p]:
+                if err_idx in prev_blk:
+                    # Avoid adding duplicates
+                    item = (prev_p, prev_blk)
+                    if item not in revisit_queue:
+                        revisit_queue.append(item)
+                    break
+
+    for pass_idx in range(num_passes):
+        for blk_indices in blocks_by_pass[pass_idx]:
             p_alice_local = sum(alice[i] for i in blk_indices) % 2
             p_bob_local = sum(bob[i] for i in blk_indices) % 2
             disclosed_bits += 1
 
             if sim_alice is not None and sim_bob is not None:
-                # Authenticated exchange for initial block parity
                 frame_a = sim_alice.send_frame("parity", {"p": p_alice_local})
                 frame_b = sim_bob.send_frame("parity", {"p": p_bob_local})
-
-                # Receive frames (will raise ValueError on tamper)
                 rx_a = sim_bob.receive_frame(frame_a)
                 rx_b = sim_alice.receive_frame(frame_b)
-
-                p_alice = rx_a["p"]
-                p_bob = rx_b["p"]
+                p_a = rx_a["p"]
+                p_b = rx_b["p"]
             else:
-                p_alice = p_alice_local
-                p_bob = p_bob_local
+                p_a = p_alice_local
+                p_b = p_bob_local
 
-            if p_alice != p_bob:
-                lo, hi = 0, len(blk_indices)
-                while (hi - lo) > 1:
-                    mid = (lo + hi) // 2
-                    left_indices = blk_indices[lo:mid]
-                    p_a_left_local = sum(alice[i] for i in left_indices) % 2
-                    p_b_left_local = sum(bob[i] for i in left_indices) % 2
+            if p_a != p_b:
+                err_idx = _bisect_block(blk_indices)
+                queue_revisits(err_idx, pass_idx)
+
+                # Process revisits
+                while revisit_queue and revisit_budget > 0:
+                    rp, r_blk = revisit_queue.pop(0)
+                    revisit_budget -= 1
+
+                    rp_a_local = sum(alice[i] for i in r_blk) % 2
+                    rp_b_local = sum(bob[i] for i in r_blk) % 2
                     disclosed_bits += 1
 
                     if sim_alice is not None and sim_bob is not None:
-                        # Authenticated exchange for bisection parity
-                        frame_a = sim_alice.send_frame("bisection_parity", {"p": p_a_left_local})
-                        frame_b = sim_bob.send_frame("bisection_parity", {"p": p_b_left_local})
-
-                        rx_a = sim_bob.receive_frame(frame_a)
-                        rx_b = sim_alice.receive_frame(frame_b)
-
-                        p_a_left = rx_a["p"]
-                        p_b_left = rx_b["p"]
+                        f_a = sim_alice.send_frame("revisit_parity", {"p": rp_a_local})
+                        f_b = sim_bob.send_frame("revisit_parity", {"p": rp_b_local})
+                        r_a = sim_bob.receive_frame(f_a)
+                        r_b = sim_alice.receive_frame(f_b)
+                        rp_a = r_a["p"]
+                        rp_b = r_b["p"]
                     else:
-                        p_a_left = p_a_left_local
-                        p_b_left = p_b_left_local
+                        rp_a = rp_a_local
+                        rp_b = rp_b_local
 
-                    if p_a_left != p_b_left:
-                        hi = mid
-                    else:
-                        lo = mid
-
-                err_idx = blk_indices[lo]
-                bob[err_idx] = 1 - bob[err_idx]
+                    if rp_a != rp_b:
+                        err_idx2 = _bisect_block(r_blk)
+                        # Queue all blocks from passes up to current pass_idx (except rp) containing err_idx2
+                        for other_p in range(pass_idx + 1):
+                            if other_p == rp:
+                                continue
+                            for other_blk in blocks_by_pass[other_p]:
+                                if err_idx2 in other_blk:
+                                    item = (other_p, other_blk)
+                                    if item not in revisit_queue:
+                                        revisit_queue.append(item)
+                                    break
 
         # Verification / Confirmation tag check after this pass
         alice_tag_local = _compute_tag(alice)
@@ -439,13 +491,10 @@ def reconcile_keys(
         disclosed_bits += tag_bits
 
         if sim_alice is not None and sim_bob is not None:
-            # Authenticated exchange for verification tag
             frame_a = sim_alice.send_frame("verification_tag", {"tag": alice_tag_local.hex()})
             frame_b = sim_bob.send_frame("verification_tag", {"tag": bob_tag_local.hex()})
-
             rx_a = sim_bob.receive_frame(frame_a)
             rx_b = sim_alice.receive_frame(frame_b)
-
             alice_tag = bytes.fromhex(rx_a["tag"])
             bob_tag = bytes.fromhex(rx_b["tag"])
         else:
@@ -457,14 +506,13 @@ def reconcile_keys(
 
     return alice, bob, disclosed_bits, False
 
-
 # ── Constants for Conservative Frame-Budget Bounds ────────────────────────
 # Note: 4,700 frames is a conservative future framed-channel design estimate.
 # Assumptions: at most 15 rounds, batches capped at 4,000 bits, three
-# reconciliation passes with block sizes 32/32/48, and proposed future framing
-# that groups block parities. The current code sends no classical frames
-# (it performs these operations directly in memory), so this is a design
-# estimate, not an enforced frame counter.
+# reconciliation passes with block sizes 32/32/48, and up to 50 revisits.
+# This bound includes basis exchange, parameter estimation, reconciliation,
+# PA seeds, and confirmation tags exchanged over the simulated authenticated
+# channel.
 TARGET_SIFTED_BITS = 3200
 MAX_BATCH_SIZE = 4000
 MAX_ROUNDS_LIMIT = 15
@@ -506,7 +554,7 @@ def run_secure_bb84(
     7. Two-stage Privacy Amplification (PA): First stage extracts an intermediate key (e.g., 419 bits).
        Then, an authenticated final-key confirmation exposes a 32-bit universal tag.
        Finally, a second PA stage compresses the remaining conditional min-entropy into the final application key.
-    8. Composable Secrecy Calculation: The secrecy bound is hybrid, explicitly calculating the first extraction error, 
+    8. Composable Secrecy Calculation: The secrecy bound is hybrid, explicitly calculating the first extraction error,
        at-most-32-bit confirmation leakage, and second extraction error. Correctness error is independent, derived
        exclusively from the final confirmation tag.
     9. Enforces sufficient raw key bound (ell_max) to support the required intermediate key length.
@@ -964,55 +1012,55 @@ def run_secure_bb84(
         }
 
     # ── Two-Stage Privacy Amplification & Key Confirmation ────────────────────
-    
+
     # Stage 1: Extract intermediate key with sufficient entropy for final tag + key
     seed_length_1 = len(rec_aarav) + first_pa_output_length - 1
     toeplitz_seed_1_aarav = [rng.randint(0, 1) for _ in range(seed_length_1)]
-    
+
     try:
         if sim_alice is not None and sim_bob is not None:
             # 1. First PA Seed Exchange
             frame_a_seed1 = sim_alice.send_frame("toeplitz_seed", {"seed": toeplitz_seed_1_aarav})
             rx_diya_seed1 = sim_bob.receive_frame(frame_a_seed1)
             toeplitz_seed_1_diya = rx_diya_seed1["seed"]
-            
+
             if not isinstance(toeplitz_seed_1_diya, list) or len(toeplitz_seed_1_diya) != seed_length_1 or not all(b in (0, 1) for b in toeplitz_seed_1_diya):
                 raise AuthenticationError("Invalid Toeplitz seed format received.")
-            
+
             frame_b_ack1 = sim_bob.send_frame("toeplitz_seed_ack", {"status": "ok"})
             if frame_b_ack1.get("msg_type") != "toeplitz_seed_ack":
                 raise AuthenticationError("Invalid acknowledgment message type.")
             rx_ack1_payload = sim_alice.receive_frame(frame_b_ack1)
             if rx_ack1_payload.get("status") != "ok":
                 raise AuthenticationError("Invalid acknowledgment status.")
-            
+
             # Apply Stage 1 PA
             pa1_out_aarav = toeplitz_hash(rec_aarav, first_pa_output_length, toeplitz_seed_1_aarav)
             pa1_out_diya = toeplitz_hash(rec_diya, first_pa_output_length, toeplitz_seed_1_diya)
-            
+
             # 2. Final Key Confirmation
             conf_seed_len = first_pa_output_length + tag_bits - 1
             conf_seed_aarav = [rng.randint(0, 1) for _ in range(conf_seed_len)]
             conf_tag_aarav = toeplitz_hash(pa1_out_aarav, tag_bits, conf_seed_aarav)
-            
+
             frame_a_conf = sim_alice.send_frame("key_confirmation", {"seed": conf_seed_aarav, "tag": conf_tag_aarav})
             rx_b_conf = sim_bob.receive_frame(frame_a_conf)
-            
+
             conf_seed_diya = rx_b_conf["seed"]
             received_tag = rx_b_conf["tag"]
-            
+
             conf_tag_diya = toeplitz_hash(pa1_out_diya, tag_bits, conf_seed_diya)
             match_status = "match" if conf_tag_diya == received_tag else "mismatch"
-            
+
             frame_b_conf_ack = sim_bob.send_frame("key_confirmation_ack", {"status": match_status})
-            
+
             if frame_b_conf_ack.get("msg_type") != "key_confirmation_ack":
                 raise AuthenticationError("Invalid confirmation ack type.")
             rx_ack2_payload = sim_alice.receive_frame(frame_b_conf_ack)
-            
+
             if rx_ack2_payload.get("status") not in ("match", "mismatch"):
                 raise AuthenticationError("Invalid confirmation ack status.")
-                
+
             if rx_ack2_payload.get("status") != "match":
                 return {
                     "secure": False,
@@ -1031,39 +1079,39 @@ def run_secure_bb84(
                     "keys_match": False,
                     "reason": "privacy_amplification_mismatch",
                 }
-            
+
             # 3. Second PA Seed Exchange
             seed_length_2 = first_pa_output_length + min_key_length - 1
             toeplitz_seed_2_aarav = [rng.randint(0, 1) for _ in range(seed_length_2)]
-            
+
             frame_a_seed2 = sim_alice.send_frame("toeplitz_seed2", {"seed": toeplitz_seed_2_aarav})
             rx_diya_seed2 = sim_bob.receive_frame(frame_a_seed2)
             toeplitz_seed_2_diya = rx_diya_seed2["seed"]
-            
+
             if not isinstance(toeplitz_seed_2_diya, list) or len(toeplitz_seed_2_diya) != seed_length_2 or not all(b in (0, 1) for b in toeplitz_seed_2_diya):
                 raise AuthenticationError("Invalid second Toeplitz seed format.")
-            
+
             frame_b_ack2 = sim_bob.send_frame("toeplitz_seed2_ack", {"status": "ok"})
             if frame_b_ack2.get("msg_type") != "toeplitz_seed2_ack":
                 raise AuthenticationError("Invalid second ack message type.")
             rx_ack3_payload = sim_alice.receive_frame(frame_b_ack2)
             if rx_ack3_payload.get("status") != "ok":
                 raise AuthenticationError("Invalid second ack status.")
-                
+
             # Apply Stage 2 PA
             final_key_aarav = toeplitz_hash(pa1_out_aarav, min_key_length, toeplitz_seed_2_aarav)
             final_key_diya = toeplitz_hash(pa1_out_diya, min_key_length, toeplitz_seed_2_diya)
-            
+
         else:
             # Local unauthenticated simulation mode
             pa1_out_aarav = toeplitz_hash(rec_aarav, first_pa_output_length, toeplitz_seed_1_aarav)
             pa1_out_diya = toeplitz_hash(rec_diya, first_pa_output_length, toeplitz_seed_1_aarav)
-            
+
             conf_seed_len = first_pa_output_length + tag_bits - 1
             conf_seed_aarav = [rng.randint(0, 1) for _ in range(conf_seed_len)]
             conf_tag_aarav = toeplitz_hash(pa1_out_aarav, tag_bits, conf_seed_aarav)
             conf_tag_diya = toeplitz_hash(pa1_out_diya, tag_bits, conf_seed_aarav)
-            
+
             if conf_tag_aarav != conf_tag_diya:
                 return {
                     "secure": False,
@@ -1082,13 +1130,13 @@ def run_secure_bb84(
                     "keys_match": False,
                     "reason": "privacy_amplification_mismatch",
                 }
-                
+
             seed_length_2 = first_pa_output_length + min_key_length - 1
             toeplitz_seed_2_aarav = [rng.randint(0, 1) for _ in range(seed_length_2)]
-            
+
             final_key_aarav = toeplitz_hash(pa1_out_aarav, min_key_length, toeplitz_seed_2_aarav)
             final_key_diya = toeplitz_hash(pa1_out_diya, min_key_length, toeplitz_seed_2_aarav)
-            
+
     except AuthenticationError:
         return {
             "secure": False,
