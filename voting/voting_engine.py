@@ -562,8 +562,8 @@ class VotingEngine:
                 if not bb84_result.get("secure", False) or bb84_result.get("aborted", True):
                     reason = bb84_result.get("reason", "unknown")
                     raise BB84SecurityError(f"BB84 security check failed: {reason}")
-                bb84_key = bb84_result["final_key"]
-                if len(bb84_key) < 256:
+                bb84_key = bb84_result.get("final_key")
+                if bb84_key is None or not isinstance(bb84_key, list) or len(bb84_key) < 256 or not all(type(b) is int and b in (0, 1) for b in bb84_key):
                     raise BB84SecurityError("BB84 security check failed: undersized or invalid key.")
 
                 # 3.3 Post-Quantum Encryption (vol3)
@@ -707,8 +707,8 @@ class VotingEngine:
                 reason = bb84_result.get("reason", "unknown")
                 raise BB84SecurityError(f"BB84 security check failed: {reason}")
 
-            bb84_key = bb84_result["final_key"]
-            if len(bb84_key) < 256:
+            bb84_key = bb84_result.get("final_key")
+            if bb84_key is None or not isinstance(bb84_key, list) or len(bb84_key) < 256 or not all(type(b) is int and b in (0, 1) for b in bb84_key):
                 raise BB84SecurityError("BB84 security check failed: undersized or invalid key.")
 
             # 3.3 Post-Quantum Encryption (vol3)

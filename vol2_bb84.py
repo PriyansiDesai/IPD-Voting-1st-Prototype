@@ -180,6 +180,8 @@ def compute_finite_key_bound(
     eps_pa: float = 1e-10,
     eps_s: float = 1e-10,
     eps_c: float = 1e-10,
+    eps_pa2: float = 0.0,
+    eps_s2: float = 0.0,
 ) -> dict[str, Any]:
     """
     Calculates the extractable secret key length using the finite-key analysis
@@ -192,13 +194,15 @@ def compute_finite_key_bound(
         sample_error_count: Number of bit errors observed in the sample of size m.
         reconciliation_disclosed_bits: Total bits disclosed classically during reconciliation & tag.
         eps_pe: Parameter estimation failure probability.
-        eps_pa: Privacy amplification collision probability.
-        eps_s: Smooth min-entropy smoothing parameter.
+        eps_pa: First privacy amplification collision probability.
+        eps_s: Smooth min-entropy smoothing parameter (first PA).
         eps_c: Correctness verification failure probability (e.g. 2^-tag_bits).
+        eps_pa2: Second privacy amplification collision probability.
+        eps_s2: Smooth min-entropy smoothing parameter (second PA).
 
     Returns:
         dict with key length ell, parameter estimation deviation gamma, phase error bound e_ph,
-        PA penalty delta_pa, and total composable security parameter eps_sec.
+        PA penalty delta_pa, composed secrecy error eps_sec, correctness error eps_c, and eps_total.
     """
     if n <= 0 or m <= 0:
         return {
@@ -210,12 +214,14 @@ def compute_finite_key_bound(
             "reconciliation_disclosed_bits": reconciliation_disclosed_bits,
             "delta_pa": 0.0,
             "eps_sec": 1.0,
+            "eps_c": 1.0,
+            "eps_total": 1.0,
             "valid": False,
         }
 
     # Reject invalid security-parameter inputs
-    if any(e <= 0.0 or e >= 1.0 for e in [eps_pe, eps_pa, eps_s, eps_c]):
-        raise ValueError("Security parameters (eps) must be strictly between 0 and 1.")
+    if any(e <= 0.0 or e >= 1.0 for e in [eps_pe, eps_pa, eps_s, eps_c]) or (eps_pa2 < 0.0 or eps_pa2 >= 1.0) or (eps_s2 < 0.0 or eps_s2 >= 1.0):
+        raise ValueError("Security parameters (eps) must be strictly valid.")
 
     qber = sample_error_count / m
 
@@ -231,8 +237,11 @@ def compute_finite_key_bound(
     # Privacy amplification penalty (Tomamichel et al. 2012, Eq. 1)
     delta_pa = 2.0 * math.log2(1.0 / (2.0 * eps_pa)) + 2.0 * math.log2(1.0 / eps_s)
 
-    # Composable security parameter eps_sec = eps_pe + 2*eps_s + eps_pa + eps_c
-    eps_sec = eps_pe + 2.0 * eps_s + eps_pa + eps_c
+    # Composable secrecy parameter includes first extraction and second extraction (if any)
+    eps_sec = eps_pe + 2.0 * eps_s + eps_pa + 2.0 * eps_s2 + eps_pa2
+    
+    # Combined total error (secrecy + correctness)
+    eps_total = eps_sec + eps_c
 
     raw_extractable = n * (1.0 - h_eph) - reconciliation_disclosed_bits - delta_pa
     ell = math.floor(raw_extractable)
@@ -247,6 +256,8 @@ def compute_finite_key_bound(
         "reconciliation_disclosed_bits": reconciliation_disclosed_bits,
         "delta_pa": delta_pa,
         "eps_sec": eps_sec,
+        "eps_c": eps_c,
+        "eps_total": eps_total,
         "valid": ell > 0,
     }
 
@@ -326,7 +337,8 @@ def reconcile_keys(
     267 blocks across the three passes. This yields 534 initial-parity frames, plus at most 2,804
     bisection frames (assuming worst-case bisection steps for all blocks), and up to 6 tag frames
     across the three passes, for a maximum of 3,344 reconciliation frames. Including parameter
-    estimation and sifting, this fits securely within the 4,700-frame budget.
+    estimation, sifting, the first PA seed exchange (2 frames), final key confirmation (2 frames),
+    and the second PA seed exchange (2 frames), the projected total is 3,382 frames.
 
     Returns:
         (alice_reconciled, bob_reconciled, disclosed_bits, success)
@@ -491,9 +503,14 @@ def run_secure_bb84(
     5. Multi-pass key reconciliation with exact classical leakage tracking and tag confirmation.
     6. Published finite-key bound calculation (Tomamichel et al. 2012) bounding phase error
        via Serfling (1974) parameter estimation.
-    7. 2-universal Toeplitz hash extractor for privacy amplification.
-    8. Enforces >= 256-bit final key; aborts if finite-key bound permits < 256 bits.
-    9. OS-backed randomness by default (via random.SystemRandom); deterministic PRNG only when seeded.
+    7. Two-stage Privacy Amplification (PA): First stage extracts an intermediate key (e.g., 419 bits).
+       Then, an authenticated final-key confirmation exposes a 32-bit universal tag.
+       Finally, a second PA stage compresses the remaining conditional min-entropy into the final application key.
+    8. Composable Secrecy Calculation: The secrecy bound is hybrid, explicitly calculating the first extraction error, 
+       at-most-32-bit confirmation leakage, and second extraction error. Correctness error is independent, derived
+       exclusively from the final confirmation tag.
+    9. Enforces sufficient raw key bound (ell_max) to support the required intermediate key length.
+    10. OS-backed randomness by default (via random.SystemRandom); deterministic PRNG only when seeded.
     """
     if min_key_length < 256:
         return {
@@ -837,7 +854,7 @@ def run_secure_bb84(
 
     # ── Key Reconciliation & Verification ─────────────────────────────────────
     tag_bits = 32
-    eps_c = 2 ** (-tag_bits)
+    eps_c = 2.0 ** (-tag_bits)  # Strictly justified by final universal Toeplitz hash confirmation
 
     try:
         rec_aarav, rec_diya, leak_ec, rec_success = reconcile_keys(
@@ -915,11 +932,17 @@ def run_secure_bb84(
         eps_pa=eps_pa,
         eps_s=eps_s,
         eps_c=eps_c,
+        eps_pa2=eps_pa,
+        eps_s2=eps_s,
     )
 
     ell_max = bound_result["ell"]
 
-    if ell_max < min_key_length:
+    # Calculate second extraction penalty (Delta_pa2)
+    delta_pa2 = 2.0 * math.log2(1.0 / (2.0 * eps_pa)) + 2.0 * math.log2(1.0 / eps_s)
+    first_pa_output_length = min_key_length + tag_bits + math.ceil(delta_pa2)
+
+    if ell_max < first_pa_output_length:
         return {
             "secure": False,
             "aborted": True,
@@ -940,16 +963,133 @@ def run_secure_bb84(
             "reason": "finite_key_bound_insufficient",
         }
 
-    # ── Privacy Amplification (Toeplitz Hashing) ──────────────────────────────
-    output_length = min_key_length  # Exactly 256 bits extracted
-    seed_length = len(rec_aarav) + output_length - 1
-    toeplitz_seed = [rng.randint(0, 1) for _ in range(seed_length)]
-
-    final_key_aarav = toeplitz_hash(rec_aarav, output_length, toeplitz_seed)
-    final_key_diya = toeplitz_hash(rec_diya, output_length, toeplitz_seed)
-
-    keys_match = (final_key_aarav == final_key_diya)
-    if not keys_match or len(final_key_aarav) < min_key_length:
+    # ── Two-Stage Privacy Amplification & Key Confirmation ────────────────────
+    
+    # Stage 1: Extract intermediate key with sufficient entropy for final tag + key
+    seed_length_1 = len(rec_aarav) + first_pa_output_length - 1
+    toeplitz_seed_1_aarav = [rng.randint(0, 1) for _ in range(seed_length_1)]
+    
+    try:
+        if sim_alice is not None and sim_bob is not None:
+            # 1. First PA Seed Exchange
+            frame_a_seed1 = sim_alice.send_frame("toeplitz_seed", {"seed": toeplitz_seed_1_aarav})
+            rx_diya_seed1 = sim_bob.receive_frame(frame_a_seed1)
+            toeplitz_seed_1_diya = rx_diya_seed1["seed"]
+            
+            if not isinstance(toeplitz_seed_1_diya, list) or len(toeplitz_seed_1_diya) != seed_length_1 or not all(b in (0, 1) for b in toeplitz_seed_1_diya):
+                raise AuthenticationError("Invalid Toeplitz seed format received.")
+            
+            frame_b_ack1 = sim_bob.send_frame("toeplitz_seed_ack", {"status": "ok"})
+            if frame_b_ack1.get("msg_type") != "toeplitz_seed_ack":
+                raise AuthenticationError("Invalid acknowledgment message type.")
+            rx_ack1_payload = sim_alice.receive_frame(frame_b_ack1)
+            if rx_ack1_payload.get("status") != "ok":
+                raise AuthenticationError("Invalid acknowledgment status.")
+            
+            # Apply Stage 1 PA
+            pa1_out_aarav = toeplitz_hash(rec_aarav, first_pa_output_length, toeplitz_seed_1_aarav)
+            pa1_out_diya = toeplitz_hash(rec_diya, first_pa_output_length, toeplitz_seed_1_diya)
+            
+            # 2. Final Key Confirmation
+            conf_seed_len = first_pa_output_length + tag_bits - 1
+            conf_seed_aarav = [rng.randint(0, 1) for _ in range(conf_seed_len)]
+            conf_tag_aarav = toeplitz_hash(pa1_out_aarav, tag_bits, conf_seed_aarav)
+            
+            frame_a_conf = sim_alice.send_frame("key_confirmation", {"seed": conf_seed_aarav, "tag": conf_tag_aarav})
+            rx_b_conf = sim_bob.receive_frame(frame_a_conf)
+            
+            conf_seed_diya = rx_b_conf["seed"]
+            received_tag = rx_b_conf["tag"]
+            
+            conf_tag_diya = toeplitz_hash(pa1_out_diya, tag_bits, conf_seed_diya)
+            match_status = "match" if conf_tag_diya == received_tag else "mismatch"
+            
+            frame_b_conf_ack = sim_bob.send_frame("key_confirmation_ack", {"status": match_status})
+            
+            if frame_b_conf_ack.get("msg_type") != "key_confirmation_ack":
+                raise AuthenticationError("Invalid confirmation ack type.")
+            rx_ack2_payload = sim_alice.receive_frame(frame_b_conf_ack)
+            
+            if rx_ack2_payload.get("status") not in ("match", "mismatch"):
+                raise AuthenticationError("Invalid confirmation ack status.")
+                
+            if rx_ack2_payload.get("status") != "match":
+                return {
+                    "secure": False,
+                    "aborted": True,
+                    "qber": qber,
+                    "sample_size": sample_size,
+                    "error_count": error_count,
+                    "qber_threshold": qber_threshold,
+                    "sifted_key_length": total_sifted,
+                    "final_key": None,
+                    "final_key_length": 0,
+                    "eavesdrop": eavesdrop,
+                    "sample_indices": sample_indices,
+                    "remaining_indices": remaining_indices,
+                    "reconciliation_disclosed_bits": leak_ec,
+                    "keys_match": False,
+                    "reason": "privacy_amplification_mismatch",
+                }
+            
+            # 3. Second PA Seed Exchange
+            seed_length_2 = first_pa_output_length + min_key_length - 1
+            toeplitz_seed_2_aarav = [rng.randint(0, 1) for _ in range(seed_length_2)]
+            
+            frame_a_seed2 = sim_alice.send_frame("toeplitz_seed2", {"seed": toeplitz_seed_2_aarav})
+            rx_diya_seed2 = sim_bob.receive_frame(frame_a_seed2)
+            toeplitz_seed_2_diya = rx_diya_seed2["seed"]
+            
+            if not isinstance(toeplitz_seed_2_diya, list) or len(toeplitz_seed_2_diya) != seed_length_2 or not all(b in (0, 1) for b in toeplitz_seed_2_diya):
+                raise AuthenticationError("Invalid second Toeplitz seed format.")
+            
+            frame_b_ack2 = sim_bob.send_frame("toeplitz_seed2_ack", {"status": "ok"})
+            if frame_b_ack2.get("msg_type") != "toeplitz_seed2_ack":
+                raise AuthenticationError("Invalid second ack message type.")
+            rx_ack3_payload = sim_alice.receive_frame(frame_b_ack2)
+            if rx_ack3_payload.get("status") != "ok":
+                raise AuthenticationError("Invalid second ack status.")
+                
+            # Apply Stage 2 PA
+            final_key_aarav = toeplitz_hash(pa1_out_aarav, min_key_length, toeplitz_seed_2_aarav)
+            final_key_diya = toeplitz_hash(pa1_out_diya, min_key_length, toeplitz_seed_2_diya)
+            
+        else:
+            # Local unauthenticated simulation mode
+            pa1_out_aarav = toeplitz_hash(rec_aarav, first_pa_output_length, toeplitz_seed_1_aarav)
+            pa1_out_diya = toeplitz_hash(rec_diya, first_pa_output_length, toeplitz_seed_1_aarav)
+            
+            conf_seed_len = first_pa_output_length + tag_bits - 1
+            conf_seed_aarav = [rng.randint(0, 1) for _ in range(conf_seed_len)]
+            conf_tag_aarav = toeplitz_hash(pa1_out_aarav, tag_bits, conf_seed_aarav)
+            conf_tag_diya = toeplitz_hash(pa1_out_diya, tag_bits, conf_seed_aarav)
+            
+            if conf_tag_aarav != conf_tag_diya:
+                return {
+                    "secure": False,
+                    "aborted": True,
+                    "qber": qber,
+                    "sample_size": sample_size,
+                    "error_count": error_count,
+                    "qber_threshold": qber_threshold,
+                    "sifted_key_length": total_sifted,
+                    "final_key": None,
+                    "final_key_length": 0,
+                    "eavesdrop": eavesdrop,
+                    "sample_indices": sample_indices,
+                    "remaining_indices": remaining_indices,
+                    "reconciliation_disclosed_bits": leak_ec,
+                    "keys_match": False,
+                    "reason": "privacy_amplification_mismatch",
+                }
+                
+            seed_length_2 = first_pa_output_length + min_key_length - 1
+            toeplitz_seed_2_aarav = [rng.randint(0, 1) for _ in range(seed_length_2)]
+            
+            final_key_aarav = toeplitz_hash(pa1_out_aarav, min_key_length, toeplitz_seed_2_aarav)
+            final_key_diya = toeplitz_hash(pa1_out_diya, min_key_length, toeplitz_seed_2_aarav)
+            
+    except AuthenticationError:
         return {
             "secure": False,
             "aborted": True,
@@ -965,7 +1105,25 @@ def run_secure_bb84(
             "remaining_indices": remaining_indices,
             "reconciliation_disclosed_bits": leak_ec,
             "keys_match": False,
-            "reason": "privacy_amplification_mismatch",
+            "reason": "authentication_failed",
+        }
+    except FrameExhaustionError:
+        return {
+            "secure": False,
+            "aborted": True,
+            "qber": qber,
+            "sample_size": sample_size,
+            "error_count": error_count,
+            "qber_threshold": qber_threshold,
+            "sifted_key_length": total_sifted,
+            "final_key": None,
+            "final_key_length": 0,
+            "eavesdrop": eavesdrop,
+            "sample_indices": sample_indices,
+            "remaining_indices": remaining_indices,
+            "reconciliation_disclosed_bits": leak_ec,
+            "keys_match": False,
+            "reason": "frame_budget_exceeded",
         }
 
     return {

@@ -84,6 +84,17 @@ class TestVol2BB84Legacy(unittest.TestCase):
 
 
 class TestVol2BB84FiniteKeyBound(unittest.TestCase):
+    def test_finite_key_error_accounting(self):
+        """Verify explicit reporting of eps_sec, eps_c, and eps_total."""
+        from vol2_bb84 import compute_finite_key_bound
+        res = compute_finite_key_bound(
+            n=2000, m=1000, sample_error_count=10, reconciliation_disclosed_bits=50,
+            eps_pe=0.01, eps_pa=0.02, eps_s=0.03, eps_c=0.04, eps_pa2=0.05, eps_s2=0.06
+        )
+        self.assertAlmostEqual(res["eps_sec"], 0.26)  # 0.01 + 2*0.03 + 0.02 + 2*0.06 + 0.05 = 0.26
+        self.assertAlmostEqual(res["eps_c"], 0.04)
+        self.assertAlmostEqual(res["eps_total"], 0.30)
+
     """Unit tests for the published Tomamichel et al. (2012) finite-key bound."""
 
     def test_finite_key_serfling_bound_calculation(self):
@@ -516,21 +527,31 @@ class TestM2BB84AbortIntegration(unittest.TestCase):
         self.assertNotIn((self.session_id, self.voter_id), self.engine._reserved_voters)
 
     def test_m2_aborts_on_none_or_malformed_bb84_key(self):
-        """When BB84 returns final_key=None despite secure=True, VotingEngine aborts."""
-        malformed_result = {
-            "secure": True,
-            "aborted": False,
-            "reason": "secure",
-            "final_key": None,
-        }
-        with patch("voting.voting_engine.run_secure_bb84", return_value=malformed_result):
-            with self.assertRaises(BB84SecurityError) as ctx:
-                self.engine.cast_vote(self.session_id, self.voter_id, self.candidate_id)
+        """When BB84 returns None or malformed final_key, VotingEngine aborts."""
+        malformed_keys = [
+            None,
+            "string_key",
+            {"key": "val"},
+            [1, 0, "1"] * 86,  # Mixed types
+            [1, 2, 0] * 86,    # Integers other than 0 or 1
+            [True, False] * 128, # Booleans should be rejected
+        ]
+        
+        for bad_key in malformed_keys:
+            malformed_result = {
+                "secure": True,
+                "aborted": False,
+                "reason": "secure",
+                "final_key": bad_key,
+            }
+            with patch("voting.voting_engine.run_secure_bb84", return_value=malformed_result):
+                with self.assertRaises(BB84SecurityError) as ctx:
+                    self.engine.cast_vote(self.session_id, self.voter_id, self.candidate_id)
 
-            self.assertIn("undersized or invalid key", str(ctx.exception))
+                self.assertIn("undersized or invalid key", str(ctx.exception))
 
-        self.assertEqual(len(self.chain.chain), self.initial_block_count)
-        self.assertNotIn((self.session_id, self.voter_id), self.engine._reserved_voters)
+            self.assertEqual(len(self.chain.chain), self.initial_block_count)
+            self.assertNotIn((self.session_id, self.voter_id), self.engine._reserved_voters)
 
     def test_voter_can_retry_after_bb84_abort(self):
         """Verifies that after an aborted BB84 attempt, reservation release allows a successful retry."""
@@ -951,6 +972,232 @@ class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
                 sim_bob=bob_ep
             )
 
+class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
+    def test_seed_exchange_valid(self):
+        """A valid Toeplitz seed exchange succeeds and both sides use the identical seed."""
+        from vol2_bb84 import run_secure_bb84
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        
+        captured_seed = {}
+        original_send = AuthenticatedChannelEndpoint.send_frame
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "toeplitz_seed":
+                captured_seed["alice"] = payload["seed"]
+            return original_send(self_obj, msg_type, payload)
+            
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+        def mock_receive(self_obj, frame):
+            res = original_receive(self_obj, frame)
+            if frame.get("msg_type") == "toeplitz_seed":
+                captured_seed["bob"] = res["seed"]
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send), \
+             patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertTrue(res["secure"])
+            self.assertIsNotNone(res["final_key"])
+            self.assertTrue(res["keys_match"])
+            self.assertIn("alice", captured_seed)
+            self.assertEqual(captured_seed["alice"], captured_seed["bob"])
+
+    def test_seed_exchange_tampering_aborts(self):
+        """Tampering with the Toeplitz seed during exchange causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        from vol2_bb84 import run_secure_bb84
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+        
+        def mock_receive(self_obj, frame):
+            if frame.get("msg_type") == "toeplitz_seed":
+                # Invert first bit
+                seed = frame["payload"]["seed"]
+                frame["payload"]["seed"] = [1 - seed[0]] + seed[1:]
+            return original_receive(self_obj, frame)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_seed_exchange_replay_aborts(self):
+        """Replaying a Toeplitz seed frame causes an immediate abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        from vol2_bb84 import run_secure_bb84
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+        
+        def mock_receive(self_obj, frame):
+            res = original_receive(self_obj, frame)
+            if frame.get("msg_type") == "toeplitz_seed":
+                original_receive(self_obj, frame)
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_seed_exchange_frame_exhaustion_aborts(self):
+        """Frame budget exhaustion during Toeplitz seed exchange fails securely."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint, FrameExhaustionError
+        from vol2_bb84 import run_secure_bb84
+        original_send = AuthenticatedChannelEndpoint.send_frame
+        
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "toeplitz_seed":
+                raise FrameExhaustionError("Frame budget exceeded")
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "frame_budget_exceeded")
+            self.assertIsNone(res["final_key"])
+
+    def test_seed_ack_tampering_aborts(self):
+        """Tampering with the Toeplitz seed acknowledgment message type or status causes an abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        from vol2_bb84 import run_secure_bb84
+
+        # Test tampering with msg_type
+        original_send = AuthenticatedChannelEndpoint.send_frame
+        def mock_send(self_obj, msg_type, payload):
+            res = original_send(self_obj, msg_type, payload)
+            if msg_type == "toeplitz_seed_ack":
+                res["msg_type"] = "tampered_type"
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+        # Test an authenticated but unsuccessful acknowledgment status
+        original_send_status = AuthenticatedChannelEndpoint.send_frame
+        def mock_send_status(self_obj, msg_type, payload):
+            if msg_type == "toeplitz_seed_ack":
+                return original_send_status(self_obj, msg_type, {"status": "not_ok"})
+            return original_send_status(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send_status):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+
+class TestVol2BB84KeyConfirmationAuthentication(unittest.TestCase):
+    def test_key_confirmation_success(self):
+        """A valid run computes a 256-bit application key securely."""
+        from vol2_bb84 import run_secure_bb84
+        res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+        self.assertTrue(res["secure"])
+        self.assertFalse(res["aborted"])
+        self.assertEqual(res["final_key_length"], 256)
+        self.assertTrue(res["keys_match"])
+
+    def test_key_confirmation_mismatched_keys(self):
+        """Mismatched intermediate keys trigger 'mismatch' ack and safe abort."""
+        import vol2_bb84
+        from vol2_bb84 import run_secure_bb84
+        
+        original_hash = vol2_bb84.toeplitz_hash
+        call_count = 0
+        
+        def mock_hash(*args):
+            nonlocal call_count
+            res = original_hash(*args)
+            call_count += 1
+            # The second call to toeplitz_hash in Stage 1 is Bob's pa1_out_diya
+            if call_count == 2:
+                res[0] ^= 1 # flip a bit to make Bob's intermediate key different
+            return res
+
+        with patch('vol2_bb84.toeplitz_hash', new=mock_hash):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "privacy_amplification_mismatch")
+            self.assertIsNone(res["final_key"])
+
+    def test_key_confirmation_invalid_ack(self):
+        """Invalid ack payload triggers authentication_failed abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        from vol2_bb84 import run_secure_bb84
+        
+        original_send = AuthenticatedChannelEndpoint.send_frame
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "key_confirmation_ack":
+                return original_send(self_obj, msg_type, {"status": "invalid"})
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_key_confirmation_replay_only(self):
+        """Replayed confirmation frame triggers authentication abort."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+        from vol2_bb84 import run_secure_bb84
+        
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+        def mock_receive(self_obj, frame):
+            res = original_receive(self_obj, frame)
+            if frame.get("msg_type") == "key_confirmation":
+                original_receive(self_obj, frame) # Replay
+            return res
+
+        with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_key_confirmation_frame_exhaustion(self):
+        """Frame exhaustion during confirmation fails safely."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint, FrameExhaustionError
+        from vol2_bb84 import run_secure_bb84
+        
+        original_send = AuthenticatedChannelEndpoint.send_frame
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "key_confirmation":
+                raise FrameExhaustionError("Budget exceeded")
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "frame_budget_exceeded")
+            self.assertIsNone(res["final_key"])
+
+    def test_insufficient_ell_max(self):
+        """Abort if ell_max is below required first-output length."""
+        from vol2_bb84 import run_secure_bb84, compute_finite_key_bound
+        
+        # We need to simulate a case where ell_max < first_pa_output_length
+        original_compute = compute_finite_key_bound
+        def mock_compute(*args, **kwargs):
+            res = original_compute(*args, **kwargs)
+            res["ell"] = 280 # Force a low bound
+            return res
+
+        with patch('vol2_bb84.compute_finite_key_bound', new=mock_compute):
+            res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "finite_key_bound_insufficient")
 
 
 def run_all_tests():
@@ -964,6 +1211,8 @@ def run_all_tests():
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84SiftingAuthentication))
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84ParameterEstimationAuthentication))
     suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84ReconciliationAuthentication))
+    suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84SeedExchangeAuthentication))
+    suite.addTest(loader.loadTestsFromTestCase(TestVol2BB84KeyConfirmationAuthentication))
     runner = unittest.TextTestRunner(verbosity=2)
     return runner.run(suite)
 
