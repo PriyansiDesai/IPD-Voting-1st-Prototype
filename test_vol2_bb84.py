@@ -186,6 +186,7 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertTrue(res["reconciliation_success"])
         self.assertGreaterEqual(res["finite_key_bound"]["ell"], 256)
 
+    @patch('vol2_bb84.TARGET_SIFTED_BITS', 3200)
     def test_low_noise_reconciliation_succeeds_but_finite_key_bound_aborts(self):
         """1.5% noise is fully corrected by 3-pass Cascade with revisits."""
         res = run_secure_bb84(
@@ -198,6 +199,20 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertTrue(res.get("keys_match", False))
         self.assertEqual(res["reason"], "finite_key_bound_insufficient")
         self.assertIsNone(res["final_key"])
+
+    def test_medium_noise_reconciliation_succeeds(self):
+        """1.5% noise now succeeds with 4,000-bit sift target."""
+        res = run_secure_bb84(
+            min_key_length=256,
+            channel_error_rate=0.015,
+            seed=123
+        )
+        self.assertTrue(res.get("secure", False))
+        self.assertFalse(res.get("aborted", True))
+        self.assertGreater(res["qber"], 0.0)
+        self.assertIsNotNone(res["final_key"])
+        self.assertEqual(len(res["final_key"]), 256)
+        self.assertEqual(res["final_key_length"], 256)
 
     def test_very_low_noise_reconciliation_succeeds(self):
         """A deterministic test showing that a low but nonzero channel_error_rate can produce a usable key."""
@@ -319,7 +334,7 @@ class TestVol2BB84Protocol(unittest.TestCase):
 
         total_frames = parity_frames + bisection_frames + revisit_frames + verification_tag_frames + basis_frames + pe_frames + pa_conf_frames
 
-        self.assertEqual(total_frames, 4082, "Calculated bound should precisely match the documented 4082 estimate.")
+        self.assertEqual(total_frames, 4696, "Calculated bound should precisely match the documented 4696 estimate.")
         self.assertLessEqual(total_frames, MAX_FRAMES,
                              f"Worst case {total_frames} frames exceeds MAX_FRAMES {MAX_FRAMES}")
 

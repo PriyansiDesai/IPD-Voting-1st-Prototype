@@ -714,6 +714,85 @@ class TestVotingAPI(unittest.TestCase):
         self.assertIn("Admin permission required", response.json()["detail"])
 
 
+
+    @patch('voting.voting_engine.encrypt_vote')
+    @patch('voting.voting_engine.run_secure_bb84')
+    def test_m4_auth_provider_failure_reclaim(self, mock_run_secure, mock_encrypt):
+        def override_principal():
+            return Principal(issuer="test-issuer", subject="test-subject")
+        app.dependency_overrides[get_current_principal] = override_principal
+
+        import os
+        from voting.classical_channel import MAX_FRAMES
+        req_len = 16 + MAX_FRAMES * 16
+
+        call_count = [0]
+        generated_key = [None]
+        def flappy_provider(length):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("Provider failed on first call")
+            else:
+                key = os.urandom(length)
+                generated_key[0] = key
+                return key
+
+        original_provider = engine.auth_key_provider
+        engine.auth_key_provider = flappy_provider
+        try:
+            # 1. First /vote request
+            ik1 = str(uuid.uuid4())
+            response1 = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik1})
+
+            self.assertEqual(response1.status_code, 422)
+            self.assertIn("Cryptographic pipeline failed", response1.json()["detail"])
+
+            mock_run_secure.assert_not_called()
+            mock_encrypt.assert_not_called()
+
+            conn = self.repo.get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT status FROM voter_participation WHERE session_id='S1' AND voter_id='V1'")
+                    row = cur.fetchone()
+                    self.assertIsNotNone(row)
+                    self.assertEqual(row[0], 'PENDING')
+
+                    cur.execute("SELECT COUNT(*) FROM ballots WHERE session_id='S1'")
+                    self.assertEqual(cur.fetchone()[0], 0)
+
+                    cur.execute("UPDATE voter_participation SET reserved_at = CURRENT_TIMESTAMP - INTERVAL '6 minutes' WHERE session_id='S1' AND voter_id='V1'")
+                conn.commit()
+            finally:
+                self.repo.pool.putconn(conn)
+
+            # 3. Retry with new IK
+            ik2 = str(uuid.uuid4())
+            mock_run_secure.return_value = {"secure": True, "aborted": False, "final_key": [0]*256}
+            mock_encrypt.return_value = b"test_ciphertext"
+
+            response2 = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik2})
+            self.assertEqual(response2.status_code, 200)
+
+            self.assertEqual(mock_encrypt.call_count, 1)
+
+            self.assertEqual(mock_run_secure.call_count, 1)
+            self.assertEqual(mock_run_secure.call_args[1].get("auth_key"), generated_key[0])
+
+            conn = self.repo.get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT status FROM voter_participation WHERE session_id='S1' AND voter_id='V1'")
+                    self.assertEqual(cur.fetchone()[0], 'COMMITTED')
+
+                    cur.execute("SELECT COUNT(*) FROM ballots WHERE session_id='S1'")
+                    self.assertEqual(cur.fetchone()[0], 1)
+            finally:
+                self.repo.pool.putconn(conn)
+        finally:
+            engine.auth_key_provider = original_provider
+
+
 class TestAdminCheckAuth(unittest.TestCase):
     @patch.dict(os.environ, {"DEV_ADMIN_CHECK_ENABLED": "1"})
     def test_admin_check_auth(self):

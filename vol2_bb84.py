@@ -339,12 +339,12 @@ def reconcile_keys(
     unforgeable (random oracle heuristic), a strict information-theoretic composable bound
     would require an eps-almost 2-universal hash family (e.g., polynomial evaluation over GF(2^t)).
     Thus, eps_c = 2^-32 serves here as an educational estimate for the correctness bound.
-    Frame Budget (Estimate only): The conservative maximum Z-key input is 3,199 bits, giving at most
-    267 blocks across the three passes. This yields 534 initial-parity frames, plus bisections
-    and a bounded revisit queue (capped at 50 revisits, each up to 6 bisections + 1 parity, ~700 frames),
-    and up to 6 tag frames across the three passes, for a maximum of ~4,044 reconciliation frames. Including parameter
+    Frame Budget (Estimate only): The conservative maximum Z-key input is 3,999 bits, giving at most
+    334 blocks across the three passes. This yields 668 initial-parity frames, 3,508 main-bisection frames,
+    and a bounded revisit queue (capped at 34 revisits, each up to 6 bisections + 1 parity, 476 revisit frames),
+    and up to 6 verification-tag frames across the three passes. Including parameter
     estimation, sifting, the first PA seed exchange (2 frames), final key confirmation (2 frames),
-    and the second PA seed exchange (2 frames), the projected total is ~4,082 frames, well within the 4,700 limit.
+    and the second PA seed exchange (2 frames), the projected total is 4,696 frames, well within the 4,700 limit.
 
     Returns:
         (alice_reconciled, bob_reconciled, disclosed_bits, success)
@@ -533,12 +533,12 @@ def reconcile_keys(
 # ── Constants for Conservative Frame-Budget Bounds ────────────────────────
 # Note: 4,700 frames is a conservative future framed-channel design estimate.
 # Assumptions: at most 15 rounds, batches capped at 4,000 bits, three
-# reconciliation passes with block sizes 32/32/48, and up to 50 revisits.
+# reconciliation passes with block sizes 32/32/48, and up to 34 revisits.
 # This bound includes basis exchange, parameter estimation, reconciliation,
 # PA seeds, and confirmation tags exchanged over the simulated authenticated
 # channel.
-MAX_RECONCILIATION_REVISITS = 50
-TARGET_SIFTED_BITS = 3200
+MAX_RECONCILIATION_REVISITS = 34
+TARGET_SIFTED_BITS = 4000
 MAX_BATCH_SIZE = 4000
 MAX_ROUNDS_LIMIT = 15
 REC_NUM_PASSES = 3

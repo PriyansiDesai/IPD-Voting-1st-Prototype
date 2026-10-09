@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import threading
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Callable
 
 # Ensure project root is in sys.path so volume modules can be imported
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -132,6 +132,7 @@ class VotingEngine:
         auto_load: bool = True,
         reference_time: Optional[datetime] = None,
         use_postgres: Optional[bool] = None,
+        auth_key_provider: Optional[Callable[[int], bytes]] = None,
     ):
         import os
         if use_postgres is None:
@@ -153,6 +154,7 @@ class VotingEngine:
             self.data_dir = Path(data_dir)
 
         self.reference_time: Optional[datetime] = reference_time
+        self.auth_key_provider = auth_key_provider
 
         # Loaded reference datasets from M1 CSVs
         self.voters: Dict[str, Dict[str, str]] = {}
@@ -558,7 +560,17 @@ class VotingEngine:
                 )
 
                 # 3.2 BB84 Quantum Key Distribution (vol2) - M4 Security Gate
-                bb84_result = run_secure_bb84(min_key_length=256)
+                auth_key = None
+                if self.auth_key_provider is not None:
+                    from voting.classical_channel import MAX_FRAMES
+                    req_len = 16 + MAX_FRAMES * 16
+                    auth_key = self.auth_key_provider(req_len)
+                    if not isinstance(auth_key, bytes) or len(auth_key) != req_len:
+                        raise BB84SecurityError(
+                            f"Simulation-only provider returned invalid auth_key (type={type(auth_key)}, "
+                            f"len={len(auth_key) if isinstance(auth_key, bytes) else 0})"
+                        )
+                bb84_result = run_secure_bb84(min_key_length=256, auth_key=auth_key)
                 if not bb84_result.get("secure", False) or bb84_result.get("aborted", True):
                     reason = bb84_result.get("reason", "unknown")
                     raise BB84SecurityError(f"BB84 security check failed: {reason}")
@@ -702,7 +714,17 @@ class VotingEngine:
             )
 
             # 3.2 BB84 Quantum Key Distribution (vol2) - M4 Security Gate
-            bb84_result = run_secure_bb84(min_key_length=256)
+            auth_key = None
+            if self.auth_key_provider is not None:
+                from voting.classical_channel import MAX_FRAMES
+                req_len = 16 + MAX_FRAMES * 16
+                auth_key = self.auth_key_provider(req_len)
+                if not isinstance(auth_key, bytes) or len(auth_key) != req_len:
+                    raise BB84SecurityError(
+                        f"Simulation-only provider returned invalid auth_key (type={type(auth_key)}, "
+                        f"len={len(auth_key) if isinstance(auth_key, bytes) else 0})"
+                    )
+            bb84_result = run_secure_bb84(min_key_length=256, auth_key=auth_key)
             if not bb84_result.get("secure", False) or bb84_result.get("aborted", True):
                 reason = bb84_result.get("reason", "unknown")
                 raise BB84SecurityError(f"BB84 security check failed: {reason}")
