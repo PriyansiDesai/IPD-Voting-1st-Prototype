@@ -1593,3 +1593,50 @@ class TestVol2BB84FrameSizeLimit(unittest.TestCase):
         with self.assertRaises(AuthenticationError) as ctx:
             bob2.receive_frame(forged_frame, "test")
         self.assertIn("exceeds maximum serialized size limit", str(ctx.exception))
+
+class TestVol2BB84AuthKeyInjection(unittest.TestCase):
+    def test_undersized_injected_key_rejected(self):
+        """Providing an auth_key that is too short fails closed gracefully."""
+        from vol2_bb84 import run_secure_bb84
+        import os
+
+        # Valid length is 16 + MAX_FRAMES * 16 (which is 16 + 4700*16 = 75216)
+        short_key = os.urandom(100)
+        res = run_secure_bb84(min_key_length=256, seed=42, auth_key=short_key)
+
+        self.assertFalse(res.get("secure", False))
+        self.assertTrue(res.get("aborted", False))
+        self.assertEqual(res["reason"], "invalid_auth_key_length")
+        self.assertIsNone(res["final_key"])
+        self.assertIn("eps_auth", res)
+
+    def test_valid_injected_key_accepted(self):
+        """Providing a correctly sized auth_key allows the protocol to succeed."""
+        from vol2_bb84 import run_secure_bb84
+        from voting.classical_channel import MAX_FRAMES
+        import os
+
+        valid_len = 16 + MAX_FRAMES * 16
+        valid_key = os.urandom(valid_len)
+
+        # Use fixed seed to ensure success path
+        res = run_secure_bb84(min_key_length=256, seed=42, auth_key=valid_key)
+
+        self.assertTrue(res.get("secure", False))
+        self.assertFalse(res.get("aborted", False))
+        self.assertIsNotNone(res["final_key"])
+        self.assertNotIn("auth_key", res) # Must not return it
+        self.assertNotIn(valid_key, str(res).encode('utf-8')) # Check it didn't sneak in as a string
+
+    def test_invalid_type_injected_key_rejected(self):
+        """Providing an auth_key of the wrong type fails closed gracefully."""
+        from vol2_bb84 import run_secure_bb84
+
+        for invalid_key in [42, "this is a string"]:
+            res = run_secure_bb84(min_key_length=256, seed=42, auth_key=invalid_key)
+
+            self.assertFalse(res.get("secure", False))
+            self.assertTrue(res.get("aborted", False))
+            self.assertEqual(res["reason"], "invalid_auth_key_type")
+            self.assertIsNone(res["final_key"])
+            self.assertIn("eps_auth", res)

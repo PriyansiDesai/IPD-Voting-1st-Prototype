@@ -564,6 +564,7 @@ def run_secure_bb84(
     eps_s: float = 1e-10,
     seed: int | None = None,
     max_rounds: int = MAX_ROUNDS_LIMIT,
+    auth_key: bytes | None = None,
 ) -> dict[str, Any]:
     """
     Simulates a four-state prepare-and-measure BB84 protocol session with finite-key bounds:
@@ -601,6 +602,46 @@ def run_secure_bb84(
     from voting.classical_channel import MAX_FRAMES, MAX_SERIALIZED_FRAME_BYTES
     l_max = math.ceil(MAX_SERIALIZED_FRAME_BYTES / 16) + 1
     eps_auth = MAX_FRAMES * l_max * (2.0 ** -128)
+
+    if auth_key is not None:
+        if not isinstance(auth_key, bytes):
+            return {
+                "secure": False,
+                "aborted": True,
+                "qber": 0.0,
+                "sample_size": 0,
+                "error_count": 0,
+                "qber_threshold": qber_threshold,
+                "sifted_key_length": 0,
+                "eps_auth": eps_auth,
+                "final_key": None,
+                "final_key_length": 0,
+                "eavesdrop": eavesdrop,
+                "sample_indices": [],
+                "remaining_indices": [],
+                "reconciliation_disclosed_bits": 0,
+                "keys_match": False,
+                "reason": "invalid_auth_key_type",
+            }
+        if len(auth_key) < 16 + MAX_FRAMES * 16:
+            return {
+                "secure": False,
+                "aborted": True,
+                "qber": 0.0,
+                "sample_size": 0,
+                "error_count": 0,
+                "qber_threshold": qber_threshold,
+                "sifted_key_length": 0,
+                "eps_auth": eps_auth,
+                "final_key": None,
+                "final_key_length": 0,
+                "eavesdrop": eavesdrop,
+                "sample_indices": [],
+                "remaining_indices": [],
+                "reconciliation_disclosed_bits": 0,
+                "keys_match": False,
+                "reason": "invalid_auth_key_length",
+            }
 
     if min_key_length < 256:
         return {
@@ -776,11 +817,14 @@ def run_secure_bb84(
 
             # Setup simulation-only channel if not already created for this run
             if "sim_allocator" not in locals():
-                import os
-                auth_key_len = 16 + MAX_FRAMES * 16
-                # Centrally generated simulation material for educational purposes,
-                # NOT a deployed pre-shared secret.
-                sim_auth_key = os.urandom(auth_key_len)
+                if auth_key is not None:
+                    sim_auth_key = auth_key
+                else:
+                    import os
+                    auth_key_len = 16 + MAX_FRAMES * 16
+                    # Centrally generated simulation material for educational purposes,
+                    # NOT a deployed pre-shared secret.
+                    sim_auth_key = os.urandom(auth_key_len)
                 sim_allocator = SynchronizedFrameAllocator(sim_auth_key)
                 sim_alice = AuthenticatedChannelEndpoint("sim-run", "alice", "bob", sim_allocator)
                 sim_bob = AuthenticatedChannelEndpoint("sim-run", "bob", "alice", sim_allocator)
