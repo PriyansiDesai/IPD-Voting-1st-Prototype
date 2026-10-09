@@ -910,6 +910,7 @@ class TestDefaultEngineAuthProvider(unittest.TestCase):
     def test_m4_default_api_provider_fresh_keys(self, mock_bb84, mock_encrypt):
         """Prove the API request logic uses the provider and gives fresh keys (isolated from startup)."""
         import api
+        # pyrefly: ignore [missing-import]
         from fastapi.testclient import TestClient
         import uuid
         
@@ -948,6 +949,7 @@ class TestDefaultEngineAuthProvider(unittest.TestCase):
     def test_m4_default_api_provider_failure_prevents_ballot(self):
         """Prove provider failure during request prevents ballot creation (isolated from startup)."""
         import api
+        # pyrefly: ignore [missing-import]
         from fastapi.testclient import TestClient
         import uuid
         

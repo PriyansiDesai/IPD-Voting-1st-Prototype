@@ -721,6 +721,51 @@ class TestM2BB84AbortIntegration(unittest.TestCase):
         self.assertEqual(len(self.chain.chain), self.initial_block_count + 1)
         self.assertIn((self.session_id, self.voter_id), self.engine._voted_voters)
 
+    def test_m3_m4_encryption_handoff_success(self):
+        """Proves the real M3->M4->encryption handoff works end-to-end."""
+        from voting.ballot_encoding import encode_choice
+        from vol2_bb84 import run_secure_bb84
+        from vol3_pqc import encrypt_vote, decrypt_vote
+
+        encoded_result = encode_choice(["C001", "C002"], "C001")
+        encoded_bits = encoded_result["encoded_bits"]
+
+        # Real seeded BB84 without eavesdropping
+        bb84_res = run_secure_bb84(seed=123, max_rounds=2, channel_error_rate=0.0)
+        self.assertTrue(bb84_res["secure"])
+        self.assertFalse(bb84_res["aborted"])
+        final_key = bb84_res["final_key"]
+
+        # Encrypt the M3 encoded_bits with the returned final_key
+        ciphertext = encrypt_vote(encoded_bits, final_key)
+
+        # Decrypt it back to the same bits
+        decrypted_bits = decrypt_vote(ciphertext, final_key)
+        self.assertEqual(decrypted_bits, encoded_bits)
+
+    @patch('voting.voting_engine.encrypt_vote')
+    def test_m3_m4_encryption_handoff_failure(self, mock_encrypt):
+        """Verifies an eavesdrop failure prevents encryption and leaves state unchanged."""
+        from vol2_bb84 import run_secure_bb84
+
+        # Wrap real BB84 to force eavesdrop and deterministic seed
+        def failing_bb84(*args, **kwargs):
+            kwargs['eavesdrop'] = True
+            kwargs['seed'] = 123
+            return run_secure_bb84(*args, **kwargs)
+
+        with patch('voting.voting_engine.run_secure_bb84', side_effect=failing_bb84):
+            with self.assertRaises(BB84SecurityError) as ctx:
+                self.engine.cast_vote(self.session_id, self.voter_id, self.candidate_id)
+            self.assertIn("qber_threshold_exceeded", str(ctx.exception))
+
+        # Assertions
+        mock_encrypt.assert_not_called()
+        self.assertEqual(len(self.chain.chain), self.initial_block_count)
+        self.assertEqual(self.engine.get_tally(self.session_id), self.initial_tally)
+        self.assertNotIn((self.session_id, self.voter_id), self.engine._reserved_voters)
+        self.assertNotIn((self.session_id, self.voter_id), self.engine._voted_voters)
+
 
 class TestVol2BB84SiftingAuthentication(unittest.TestCase):
     """Integration tests for the authenticated classical channel during basis sifting."""
