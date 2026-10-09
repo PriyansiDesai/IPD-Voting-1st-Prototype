@@ -5,6 +5,7 @@ import threading
 from typing import Any
 
 MAX_FRAMES = 4700
+MAX_SERIALIZED_FRAME_BYTES = 32768
 
 def gf2_128_mul(a: int, b: int) -> int:
     """
@@ -149,6 +150,8 @@ class AuthenticatedChannelEndpoint:
                 pad_idx, pad = self.allocator.allocate_tx_pad()
 
                 data = serialize_frame_data(self.run_id, self.my_id, msg_type, seq, pad_idx, payload)
+                if len(data) > MAX_SERIALIZED_FRAME_BYTES:
+                    raise AuthenticationError(f"Frame exceeds maximum serialized size limit: {len(data)} > {MAX_SERIALIZED_FRAME_BYTES}")
                 tag = self.mac.sign(data, pad)
 
                 self.tx_seq += 1
@@ -188,6 +191,8 @@ class AuthenticatedChannelEndpoint:
                 pad = self.allocator.consume_rx_pad(pad_idx)
 
                 data = serialize_frame_data(frame["run_id"], frame["sender"], frame["msg_type"], seq, pad_idx, frame["payload"])
+                if len(data) > MAX_SERIALIZED_FRAME_BYTES:
+                    raise AuthenticationError(f"Received frame exceeds maximum serialized size limit: {len(data)} > {MAX_SERIALIZED_FRAME_BYTES}")
 
                 expected_tag = self.mac.sign(data, pad).hex()
 

@@ -1449,3 +1449,147 @@ def run_all_tests():
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestVol2BB84AuthenticationBound(unittest.TestCase):
+    def test_authentication_bound_calculation(self):
+        """Verifies the derivation logic and calculation of eps_auth in run_secure_bb84."""
+        from vol2_bb84 import run_secure_bb84
+        from voting.classical_channel import MAX_FRAMES, MAX_SERIALIZED_FRAME_BYTES
+        import math
+
+        # Run a successful protocol to get eps_auth
+        res = run_secure_bb84(min_key_length=256, seed=42)
+
+        self.assertTrue(res.get("secure"))
+        eps_auth = res["eps_auth"]
+
+        l_max = math.ceil(MAX_SERIALIZED_FRAME_BYTES / 16) + 1
+        expected_eps_auth = MAX_FRAMES * l_max * (2.0 ** -128)
+        self.assertEqual(eps_auth, expected_eps_auth)
+
+    def test_early_returns_report_eps_auth(self):
+        """Representative early-return paths must all report the calculated eps_auth."""
+        from vol2_bb84 import run_secure_bb84, MAX_ROUNDS_LIMIT
+        from voting.classical_channel import MAX_FRAMES, MAX_SERIALIZED_FRAME_BYTES
+        import math
+
+        l_max = math.ceil(MAX_SERIALIZED_FRAME_BYTES / 16) + 1
+        expected_eps_auth = MAX_FRAMES * l_max * (2.0 ** -128)
+
+        # 1. min_key_length below supported minimum
+        res1 = run_secure_bb84(min_key_length=128)
+        self.assertEqual(res1["reason"], "min_key_length_must_be_at_least_256")
+        self.assertEqual(res1["eps_auth"], expected_eps_auth)
+
+        # 2. invalid parameters
+        res2 = run_secure_bb84(min_key_length=256, sample_ratio=1.5)
+        self.assertEqual(res2["reason"], "invalid_parameters")
+        self.assertEqual(res2["eps_auth"], expected_eps_auth)
+
+        # 3. max rounds limit exceeded – passing MAX_ROUNDS_LIMIT+1 always hits the guard
+        res3 = run_secure_bb84(min_key_length=256, max_rounds=MAX_ROUNDS_LIMIT + 1)
+        self.assertEqual(res3["reason"], "max_rounds_exceeds_limit")
+        self.assertEqual(res3["eps_auth"], expected_eps_auth)
+
+    def test_invalid_eps_auth_rejected(self):
+        """compute_finite_key_bound rejects invalid eps_auth values."""
+        from vol2_bb84 import compute_finite_key_bound
+
+        invalid_values = [-1.0, 1.0, 1.5, float('inf'), float('nan')]
+        for val in invalid_values:
+            with self.subTest(eps_auth=val):
+                with self.assertRaises(ValueError):
+                    compute_finite_key_bound(
+                        n=1000, m=200, sample_error_count=0, reconciliation_disclosed_bits=0,
+                        eps_auth=val
+                    )
+
+        # Valid value should not raise
+        res = compute_finite_key_bound(n=1000, m=200, sample_error_count=0, reconciliation_disclosed_bits=0, eps_auth=0.5)
+        self.assertEqual(res["eps_auth"], 0.5)
+
+    def test_early_abort_reports_eps_auth(self):
+        """An authenticated abort (e.g., at QBER check) must report the same eps_auth bound, not zero."""
+        from vol2_bb84 import run_secure_bb84
+        from voting.classical_channel import MAX_FRAMES, MAX_SERIALIZED_FRAME_BYTES
+        import math
+
+        # Cause an early abort at the QBER threshold by forcing high error rate
+        res = run_secure_bb84(min_key_length=256, channel_error_rate=0.5, seed=42)
+
+        self.assertFalse(res.get("secure", False))
+        self.assertTrue(res.get("aborted", False))
+        self.assertEqual(res["reason"], "qber_threshold_exceeded")
+
+        l_max = math.ceil(MAX_SERIALIZED_FRAME_BYTES / 16) + 1
+        expected_eps_auth = MAX_FRAMES * l_max * (2.0 ** -128)
+
+        self.assertIn("eps_auth", res)
+        self.assertEqual(res["eps_auth"], expected_eps_auth)
+
+    def test_total_error_composition_finite_key_bound(self):
+        """Verifies that compute_finite_key_bound correctly composes eps_auth into eps_total."""
+        from vol2_bb84 import compute_finite_key_bound
+
+        res = compute_finite_key_bound(
+            n=1000,
+            m=200,
+            sample_error_count=5,
+            reconciliation_disclosed_bits=100,
+            eps_pe=1e-10,
+            eps_pa=1e-10,
+            eps_s=1e-10,
+            eps_c=2**-32,
+            eps_auth=1e-35
+        )
+
+        self.assertEqual(res["eps_auth"], 1e-35)
+        self.assertEqual(res["eps_total"], res["eps_sec"] + res["eps_c"] + res["eps_auth"])
+
+class TestVol2BB84FrameSizeLimit(unittest.TestCase):
+    def test_oversized_frame_rejected(self):
+        """Oversized frames are rejected by the channel endpoint."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint, AuthenticationError, MAX_SERIALIZED_FRAME_BYTES, SynchronizedFrameAllocator
+        import os
+
+        alloc = SynchronizedFrameAllocator(os.urandom(16 + 4700 * 16))
+
+        alice = AuthenticatedChannelEndpoint("run1", "alice", "bob", alloc)
+        bob = AuthenticatedChannelEndpoint("run1", "bob", "alice", alloc)
+
+        # Create a payload just below limit
+        payload = {"data": "x" * (MAX_SERIALIZED_FRAME_BYTES - 200)}
+        frame = alice.send_frame("test", payload)
+        res = bob.receive_frame(frame, "test")
+        self.assertEqual(res["data"], payload["data"])
+
+        # Create an oversized payload
+        oversized = {"data": "x" * (MAX_SERIALIZED_FRAME_BYTES + 100)}
+        with self.assertRaises(AuthenticationError) as ctx:
+            alice.send_frame("test_oversize", oversized)
+        self.assertIn("exceeds maximum serialized size limit", str(ctx.exception))
+
+        # To test receive_frame independently
+        alloc2 = SynchronizedFrameAllocator(os.urandom(16 + 4700 * 16))
+        alice2 = AuthenticatedChannelEndpoint("run2", "alice", "bob", alloc2)
+        bob2 = AuthenticatedChannelEndpoint("run2", "bob", "alice", alloc2)
+
+        seq = alice2.tx_seq
+        pad_idx, pad = alice2.allocator.allocate_tx_pad()
+        from voting.classical_channel import serialize_frame_data
+        data = serialize_frame_data("run2", "alice", "test", seq, pad_idx, oversized)
+        tag = alice2.mac.sign(data, pad).hex()
+
+        forged_frame = {
+            "run_id": "run2",
+            "sender": "alice",
+            "msg_type": "test",
+            "seq_num": seq,
+            "pad_idx": pad_idx,
+            "payload": oversized,
+            "tag": tag
+        }
+
+        with self.assertRaises(AuthenticationError) as ctx:
+            bob2.receive_frame(forged_frame, "test")
+        self.assertIn("exceeds maximum serialized size limit", str(ctx.exception))

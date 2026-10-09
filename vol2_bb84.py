@@ -182,6 +182,7 @@ def compute_finite_key_bound(
     eps_c: float = 1e-10,
     eps_pa2: float = 0.0,
     eps_s2: float = 0.0,
+    eps_auth: float = 0.0,
 ) -> dict[str, Any]:
     """
     Calculates the extractable secret key length using the finite-key analysis
@@ -197,12 +198,13 @@ def compute_finite_key_bound(
         eps_pa: First privacy amplification collision probability.
         eps_s: Smooth min-entropy smoothing parameter (first PA).
         eps_c: Correctness verification failure probability (e.g. 2^-tag_bits).
+        eps_auth: Authentication forgery probability bound.
         eps_pa2: Second privacy amplification collision probability.
         eps_s2: Smooth min-entropy smoothing parameter (second PA).
 
     Returns:
         dict with key length ell, parameter estimation deviation gamma, phase error bound e_ph,
-        PA penalty delta_pa, composed secrecy error eps_sec, correctness error eps_c, and eps_total.
+        PA penalty delta_pa, composed secrecy error eps_sec, correctness error eps_c, auth error eps_auth, and eps_total.
     """
     if n <= 0 or m <= 0:
         return {
@@ -215,12 +217,13 @@ def compute_finite_key_bound(
             "delta_pa": 0.0,
             "eps_sec": 1.0,
             "eps_c": 1.0,
+            "eps_auth": 1.0,
             "eps_total": 1.0,
             "valid": False,
         }
 
     # Reject invalid security-parameter inputs
-    if any(e <= 0.0 or e >= 1.0 for e in [eps_pe, eps_pa, eps_s, eps_c]) or (eps_pa2 < 0.0 or eps_pa2 >= 1.0) or (eps_s2 < 0.0 or eps_s2 >= 1.0):
+    if any(e <= 0.0 or e >= 1.0 for e in [eps_pe, eps_pa, eps_s, eps_c]) or (eps_pa2 < 0.0 or eps_pa2 >= 1.0) or (eps_s2 < 0.0 or eps_s2 >= 1.0) or not (0.0 <= eps_auth < 1.0):
         raise ValueError("Security parameters (eps) must be strictly valid.")
 
     qber = sample_error_count / m
@@ -241,7 +244,7 @@ def compute_finite_key_bound(
     eps_sec = eps_pe + 2.0 * eps_s + eps_pa + 2.0 * eps_s2 + eps_pa2
 
     # Combined total error (secrecy + correctness)
-    eps_total = eps_sec + eps_c
+    eps_total = eps_sec + eps_c + eps_auth
 
     raw_extractable = n * (1.0 - h_eph) - reconciliation_disclosed_bits - delta_pa
     ell = math.floor(raw_extractable)
@@ -257,6 +260,7 @@ def compute_finite_key_bound(
         "delta_pa": delta_pa,
         "eps_sec": eps_sec,
         "eps_c": eps_c,
+        "eps_auth": eps_auth,
         "eps_total": eps_total,
         "valid": ell > 0,
     }
@@ -581,6 +585,23 @@ def run_secure_bb84(
     9. Enforces sufficient raw key bound (ell_max) to support the required intermediate key length.
     10. OS-backed randomness by default (via random.SystemRandom); deterministic PRNG only when seeded.
     """
+    # ── Composable Security Accounting ────────────────────────────────────────
+    # The authentication error (eps_auth) bounds the probability of a successful forgery,
+    # strictly conditional on the Wegman-Carter MAC over GF(2^128) using polynomial evaluation,
+    # uniform keys, unique pads per frame, and the enforced channel limits.
+    # Derivation:
+    # 1. For a message of L blocks, the forgery probability is L / 2^128.
+    # 2. The channel enforces MAX_SERIALIZED_FRAME_BYTES. With padding and a 16-byte length block,
+    #    the polynomial evaluation processes at most L_{max} = ceil(MAX_SERIALIZED_FRAME_BYTES / 16) + 1 blocks.
+    # 3. The protocol exchanges at most MAX_FRAMES frames. The receiver aborts immediately
+    #    upon the first failure, limiting the adversary to 1 attempt per expected message.
+    # 4. By union bound, eps_auth <= MAX_FRAMES * L_{max} * 2^-128.
+    # Note: This is an educational estimate for the MAC bound, not an independently verified composable guarantee.
+    import math
+    from voting.classical_channel import MAX_FRAMES, MAX_SERIALIZED_FRAME_BYTES
+    l_max = math.ceil(MAX_SERIALIZED_FRAME_BYTES / 16) + 1
+    eps_auth = MAX_FRAMES * l_max * (2.0 ** -128)
+
     if min_key_length < 256:
         return {
             "secure": False,
@@ -590,6 +611,7 @@ def run_secure_bb84(
             "error_count": 0,
             "qber_threshold": qber_threshold,
             "sifted_key_length": 0,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -609,6 +631,7 @@ def run_secure_bb84(
             "error_count": 0,
             "qber_threshold": qber_threshold,
             "sifted_key_length": 0,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -628,6 +651,7 @@ def run_secure_bb84(
             "error_count": 0,
             "qber_threshold": qber_threshold,
             "sifted_key_length": 0,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -748,7 +772,7 @@ def run_secure_bb84(
 
         # Sifting
         try:
-            from voting.classical_channel import SynchronizedFrameAllocator, AuthenticatedChannelEndpoint, MAX_FRAMES
+            from voting.classical_channel import SynchronizedFrameAllocator, AuthenticatedChannelEndpoint
 
             # Setup simulation-only channel if not already created for this run
             if "sim_allocator" not in locals():
@@ -784,7 +808,8 @@ def run_secure_bb84(
                 "error_count": 0,
                 "qber_threshold": qber_threshold,
                 "sifted_key_length": 0,
-                "final_key": None,
+                "eps_auth": eps_auth,
+            "final_key": None,
                 "final_key_length": 0,
                 "eavesdrop": eavesdrop,
                 "sample_indices": [],
@@ -829,6 +854,7 @@ def run_secure_bb84(
             "error_count": 0,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -888,6 +914,7 @@ def run_secure_bb84(
             "error_count": 0,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -924,6 +951,7 @@ def run_secure_bb84(
             "error_count": error_count,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -936,6 +964,8 @@ def run_secure_bb84(
 
     # ── Key Reconciliation & Verification ─────────────────────────────────────
     tag_bits = 32
+
+
     eps_c = 2.0 ** (-tag_bits)  # Strictly justified by final universal Toeplitz hash confirmation
 
     try:
@@ -957,6 +987,7 @@ def run_secure_bb84(
             "error_count": error_count,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -975,6 +1006,7 @@ def run_secure_bb84(
             "error_count": error_count,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -994,6 +1026,7 @@ def run_secure_bb84(
             "error_count": error_count,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -1016,6 +1049,7 @@ def run_secure_bb84(
         eps_c=eps_c,
         eps_pa2=eps_pa,
         eps_s2=eps_s,
+        eps_auth=eps_auth,
     )
 
     ell_max = bound_result["ell"]
@@ -1033,6 +1067,7 @@ def run_secure_bb84(
             "error_count": error_count,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -1104,7 +1139,8 @@ def run_secure_bb84(
                     "error_count": error_count,
                     "qber_threshold": qber_threshold,
                     "sifted_key_length": total_sifted,
-                    "final_key": None,
+                    "eps_auth": eps_auth,
+            "final_key": None,
                     "final_key_length": 0,
                     "eavesdrop": eavesdrop,
                     "sample_indices": sample_indices,
@@ -1153,7 +1189,8 @@ def run_secure_bb84(
                     "error_count": error_count,
                     "qber_threshold": qber_threshold,
                     "sifted_key_length": total_sifted,
-                    "final_key": None,
+                    "eps_auth": eps_auth,
+            "final_key": None,
                     "final_key_length": 0,
                     "eavesdrop": eavesdrop,
                     "sample_indices": sample_indices,
@@ -1178,6 +1215,7 @@ def run_secure_bb84(
             "error_count": error_count,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -1196,6 +1234,7 @@ def run_secure_bb84(
             "error_count": error_count,
             "qber_threshold": qber_threshold,
             "sifted_key_length": total_sifted,
+            "eps_auth": eps_auth,
             "final_key": None,
             "final_key_length": 0,
             "eavesdrop": eavesdrop,
@@ -1224,6 +1263,7 @@ def run_secure_bb84(
         "reconciliation_success": rec_success,
         "keys_match": True,
         "finite_key_bound": bound_result,
+        "eps_auth": eps_auth,
         "reason": "secure",
     }
 
