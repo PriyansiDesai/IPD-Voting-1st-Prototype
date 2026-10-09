@@ -849,5 +849,129 @@ class TestAdminCheckAuth(unittest.TestCase):
             response = client.get('/admin/check-auth')
             self.assertEqual(response.status_code, 404)
 
-if __name__ == "__main__":
+
+class TestDefaultEngineAuthProvider(unittest.TestCase):
+    def setUp(self):
+        import api
+        from unittest.mock import patch, MagicMock
+        
+        self.original_engine = getattr(api, 'engine', None)
+        self.original_overrides = getattr(api.app, 'dependency_overrides', {})
+        
+        # We set up a mocked engine for the request tests.
+        # This isolates request behavior testing from startup wiring testing.
+        from voting.voting_engine import VotingEngine
+        import os
+        
+        self.original_db_url = os.environ.get("DATABASE_URL")
+        os.environ["DATABASE_URL"] = "dummy"
+        
+        with patch('voting.postgres_db.PostgresVotingRepository'):
+            api.engine = VotingEngine(use_postgres=True, auth_key_provider=api.simulation_auth_key_provider)
+            
+        api.engine.repo = MagicMock()
+        api.engine.repo.get_voter_id_by_identity.return_value = 'V1'
+        api.engine.repo.get_voter_session_details.return_value = {
+            "session_id": "S1", "title": "T1", "status": "ACTIVE",
+            "session_type": "candidate_election", "start_time": "2000-01-01",
+            "end_time": "2100-01-01", "choices": ["C1"]
+        }
+        api.engine.repo.validate_choice.return_value = True
+        api.engine.repo.reserve_vote.return_value = (True, "mock_token", None)
+        api.engine.repo.get_session_choices.return_value = ["C1", "C2"]
+        api.engine.repo.finalize_vote.return_value = {"tx_id": "mock_tx"}
+
+    def tearDown(self):
+        import api
+        import os
+        api.engine = self.original_engine
+        api.app.dependency_overrides = self.original_overrides
+        if self.original_db_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = self.original_db_url
+
+    @patch('api.VotingEngine')
+    def test_m4_default_api_startup_wiring(self, mock_voting_engine):
+        """Verify the engine actually created by api.py at startup uses the provider."""
+        import api
+        
+        # Call the default engine builder
+        engine = api.create_default_engine()
+        
+        # Verify it was constructed with the correct arguments
+        mock_voting_engine.assert_called_once_with(
+            use_postgres=True,
+            auth_key_provider=api.simulation_auth_key_provider
+        )
+
+    @patch('voting.voting_engine.encrypt_vote')
+    @patch('voting.voting_engine.run_secure_bb84')
+    def test_m4_default_api_provider_fresh_keys(self, mock_bb84, mock_encrypt):
+        """Prove the API request logic uses the provider and gives fresh keys (isolated from startup)."""
+        import api
+        from fastapi.testclient import TestClient
+        import uuid
+        
+        self.assertIsNotNone(api.engine.auth_key_provider)
+        
+        client = TestClient(api.app)
+        
+        def mock_get_current_principal():
+            from api import Principal
+            return Principal(issuer='test-issuer', subject='V1')
+            
+        api.app.dependency_overrides[api.get_current_principal] = mock_get_current_principal
+        
+        mock_bb84.return_value = {"secure": True, "aborted": False, "final_key": [0]*256}
+        mock_encrypt.return_value = b"fake_ciphertext"
+        
+        ik1 = str(uuid.uuid4())
+        resp1 = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik1})
+        self.assertEqual(resp1.status_code, 200, resp1.text)
+        
+        ik2 = str(uuid.uuid4())
+        resp2 = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik2})
+        self.assertEqual(resp2.status_code, 200, resp2.text)
+        
+        self.assertEqual(mock_bb84.call_count, 2)
+        
+        key1 = mock_bb84.call_args_list[0][1].get("auth_key")
+        key2 = mock_bb84.call_args_list[1][1].get("auth_key")
+        
+        self.assertIsNotNone(key1)
+        self.assertIsNotNone(key2)
+        self.assertNotEqual(key1, key2)
+        self.assertGreaterEqual(len(key1), 16 + 4700 * 16)
+        self.assertGreaterEqual(len(key2), 16 + 4700 * 16)
+
+    def test_m4_default_api_provider_failure_prevents_ballot(self):
+        """Prove provider failure during request prevents ballot creation (isolated from startup)."""
+        import api
+        from fastapi.testclient import TestClient
+        import uuid
+        
+        def failing_provider(req_len):
+            raise RuntimeError("Simulation failure")
+            
+        api.engine.auth_key_provider = failing_provider
+        
+        client = TestClient(api.app)
+        
+        def mock_get_current_principal():
+            from api import Principal
+            return Principal(issuer='test-issuer', subject='V1')
+            
+        api.app.dependency_overrides[api.get_current_principal] = mock_get_current_principal
+        
+        ik = str(uuid.uuid4())
+        resp = client.post("/vote", json={"session_id": "S1", "candidate_id": "C1"}, headers={"Idempotency-Key": ik})
+        
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertIn("Cryptographic pipeline failed", resp.json()["detail"])
+        
+        api.engine.repo.finalize_vote.assert_not_called()
+
+if __name__ == '__main__':
+    import unittest
     unittest.main()

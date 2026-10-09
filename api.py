@@ -28,10 +28,26 @@ from voting.voting_engine import (
 
 app = FastAPI(title="Voting M2 API")
 
+from voting.classical_channel import MAX_FRAMES
+
+def simulation_auth_key_provider(req_len: int) -> bytes:
+    """
+    Generates fresh cryptographically random bytes.
+    This is locally generated simulation material, not a physical QKD KMS
+    or a deployed pre-shared secret.
+    """
+    return os.urandom(max(req_len, 16 + MAX_FRAMES * 16))
+
+def create_default_engine():
+    return VotingEngine(
+        use_postgres=True,
+        auth_key_provider=simulation_auth_key_provider
+    )
+
 # Instantiate a global engine; using PostgreSQL backed engine as requested.
 # The endpoint should be synchronous to avoid event loop issues with psycopg2.
 try:
-    engine = VotingEngine(use_postgres=True)
+    engine = create_default_engine()
 except Exception as e:
     engine = None
     print(f"Failed to initialize PostgreSQL VotingEngine: {e}")
