@@ -34,12 +34,12 @@ class WegmanCarterMAC:
     def sign(self, message: bytes, pad: bytes) -> bytes:
         if len(pad) != 16:
             raise ValueError("Pad must be exactly 16 bytes")
-        
+
         padded_msg = message
         rem = len(message) % 16
         if rem != 0:
             padded_msg += b'\x00' * (16 - rem)
-        
+
         # Append message length in bits as a 16-byte block
         length_block = (len(message) * 8).to_bytes(16, 'big')
         padded_msg += length_block
@@ -49,7 +49,7 @@ class WegmanCarterMAC:
             X = int.from_bytes(padded_msg[i:i+16], 'big')
             Y ^= X
             Y = gf2_128_mul(Y, self.H)
-        
+
         T = Y ^ int.from_bytes(pad, 'big')
         return T.to_bytes(16, 'big')
 
@@ -62,7 +62,7 @@ def serialize_frame_data(run_id: str, sender: str, msg_type: str, seq_num: int, 
     run_id_bytes = run_id.encode('utf-8')
     sender_bytes = sender.encode('utf-8')
     msg_type_bytes = msg_type.encode('utf-8')
-    
+
     # 2 bytes run_id len, 1 byte sender len, 1 byte msg_type len, 4 bytes seq_num, 4 bytes pad_idx
     header = struct.pack(
         "!HBB I I",
@@ -90,7 +90,7 @@ class SynchronizedFrameAllocator:
         required_len = 16 + MAX_FRAMES * 16
         if len(auth_key) < required_len:
             raise ValueError(f"Insufficient auth_key length. Expected at least {required_len} bytes.")
-        
+
         self.hash_key = auth_key[:16]
         self.pads = auth_key[16:16 + MAX_FRAMES * 16]
         self.next_tx_idx = 0
@@ -127,32 +127,32 @@ class AuthenticatedChannelEndpoint:
         self.run_id = run_id
         self.my_id = my_id
         self.peer_id = peer_id
-        
+
         if my_id not in ("alice", "bob") or peer_id not in ("alice", "bob"):
             raise ValueError("my_id and peer_id must be 'alice' and 'bob'")
-            
+
         self.allocator = allocator
         self.mac = WegmanCarterMAC(self.allocator.get_hash_key())
-        
+
         self.tx_seq = 0
         self.rx_seq = 0
         self.aborted = False
         self.lock = threading.Lock()
-        
+
     def send_frame(self, msg_type: str, payload: dict) -> dict:
         with self.lock:
             if self.aborted:
                 raise AuthenticationError("Endpoint is aborted.")
-                
+
             try:
                 seq = self.tx_seq
                 pad_idx, pad = self.allocator.allocate_tx_pad()
-                
+
                 data = serialize_frame_data(self.run_id, self.my_id, msg_type, seq, pad_idx, payload)
                 tag = self.mac.sign(data, pad)
-                
+
                 self.tx_seq += 1
-                
+
                 return {
                     "run_id": self.run_id,
                     "sender": self.my_id,
@@ -166,34 +166,37 @@ class AuthenticatedChannelEndpoint:
                 self.aborted = True
                 raise
 
-    def receive_frame(self, frame: dict) -> dict:
+    def receive_frame(self, frame: dict, expected_msg_type: str) -> dict:
         with self.lock:
             if self.aborted:
                 raise AuthenticationError("Endpoint is aborted.")
-                
+
             try:
                 if frame.get("run_id") != self.run_id:
                     raise AuthenticationError("Invalid run_id")
                 if frame.get("sender") != self.peer_id:
                     raise AuthenticationError("Invalid sender")
-                    
+
                 seq = frame.get("seq_num")
                 pad_idx = frame.get("pad_idx")
                 if seq is None or pad_idx is None:
                     raise AuthenticationError("Missing sequence number or pad index")
-                    
+
                 if seq != self.rx_seq:
                     raise AuthenticationError(f"Out of order or repeated sequence number. Expected {self.rx_seq}, got {seq}")
-                    
+
                 pad = self.allocator.consume_rx_pad(pad_idx)
-                
+
                 data = serialize_frame_data(frame["run_id"], frame["sender"], frame["msg_type"], seq, pad_idx, frame["payload"])
-                
+
                 expected_tag = self.mac.sign(data, pad).hex()
-                
+
                 if not hmac.compare_digest(frame.get("tag", ""), expected_tag):
                     raise AuthenticationError("Authentication tag mismatch")
-                    
+
+                if frame.get("msg_type") != expected_msg_type:
+                    raise AuthenticationError(f"Unexpected msg_type: expected {expected_msg_type}, got {frame.get('msg_type')}")
+
                 self.rx_seq += 1
                 return frame["payload"]
             except Exception:

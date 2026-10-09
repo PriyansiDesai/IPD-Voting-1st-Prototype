@@ -380,8 +380,12 @@ def reconcile_keys(
             if sim_alice is not None and sim_bob is not None:
                 frame_a = sim_alice.send_frame("bisection_parity", {"p": p_a_left_local})
                 frame_b = sim_bob.send_frame("bisection_parity", {"p": p_b_left_local})
-                rx_a = sim_bob.receive_frame(frame_a)
-                rx_b = sim_alice.receive_frame(frame_b)
+                rx_a = sim_bob.receive_frame(frame_a, "bisection_parity")
+                rx_b = sim_alice.receive_frame(frame_b, "bisection_parity")
+                if type(rx_a.get("p")) is not int or rx_a["p"] not in (0, 1):
+                    raise AuthenticationError("Invalid parity")
+                if type(rx_b.get("p")) is not int or rx_b["p"] not in (0, 1):
+                    raise AuthenticationError("Invalid parity")
                 p_a_left = rx_a["p"]
                 p_b_left = rx_b["p"]
             else:
@@ -440,8 +444,12 @@ def reconcile_keys(
             if sim_alice is not None and sim_bob is not None:
                 frame_a = sim_alice.send_frame("parity", {"p": p_alice_local})
                 frame_b = sim_bob.send_frame("parity", {"p": p_bob_local})
-                rx_a = sim_bob.receive_frame(frame_a)
-                rx_b = sim_alice.receive_frame(frame_b)
+                rx_a = sim_bob.receive_frame(frame_a, "parity")
+                rx_b = sim_alice.receive_frame(frame_b, "parity")
+                if type(rx_a.get("p")) is not int or rx_a["p"] not in (0, 1):
+                    raise AuthenticationError("Invalid parity")
+                if type(rx_b.get("p")) is not int or rx_b["p"] not in (0, 1):
+                    raise AuthenticationError("Invalid parity")
                 p_a = rx_a["p"]
                 p_b = rx_b["p"]
             else:
@@ -464,8 +472,12 @@ def reconcile_keys(
                     if sim_alice is not None and sim_bob is not None:
                         f_a = sim_alice.send_frame("revisit_parity", {"p": rp_a_local})
                         f_b = sim_bob.send_frame("revisit_parity", {"p": rp_b_local})
-                        r_a = sim_bob.receive_frame(f_a)
-                        r_b = sim_alice.receive_frame(f_b)
+                        r_a = sim_bob.receive_frame(f_a, "revisit_parity")
+                        r_b = sim_alice.receive_frame(f_b, "revisit_parity")
+                        if type(r_a.get("p")) is not int or r_a["p"] not in (0, 1):
+                            raise AuthenticationError("Invalid parity")
+                        if type(r_b.get("p")) is not int or r_b["p"] not in (0, 1):
+                            raise AuthenticationError("Invalid parity")
                         rp_a = r_a["p"]
                         rp_b = r_b["p"]
                     else:
@@ -493,10 +505,17 @@ def reconcile_keys(
         if sim_alice is not None and sim_bob is not None:
             frame_a = sim_alice.send_frame("verification_tag", {"tag": alice_tag_local.hex()})
             frame_b = sim_bob.send_frame("verification_tag", {"tag": bob_tag_local.hex()})
-            rx_a = sim_bob.receive_frame(frame_a)
-            rx_b = sim_alice.receive_frame(frame_b)
-            alice_tag = bytes.fromhex(rx_a["tag"])
-            bob_tag = bytes.fromhex(rx_b["tag"])
+            rx_a = sim_bob.receive_frame(frame_a, "verification_tag")
+            rx_b = sim_alice.receive_frame(frame_b, "verification_tag")
+            if not isinstance(rx_a.get("tag"), str) or len(rx_a["tag"]) != tag_bytes_len * 2:
+                raise AuthenticationError("Invalid tag")
+            if not isinstance(rx_b.get("tag"), str) or len(rx_b["tag"]) != tag_bytes_len * 2:
+                raise AuthenticationError("Invalid tag")
+            try:
+                alice_tag = bytes.fromhex(rx_a["tag"])
+                bob_tag = bytes.fromhex(rx_b["tag"])
+            except ValueError:
+                raise AuthenticationError("Invalid tag hex")
         else:
             alice_tag = alice_tag_local
             bob_tag = bob_tag_local
@@ -745,8 +764,16 @@ def run_secure_bb84(
             frame_a = sim_alice.send_frame("basis_exchange", {"bases": aarav_bases})
             frame_b = sim_bob.send_frame("basis_exchange", {"bases": diya_bases})
 
-            rx_aarav_bases = sim_bob.receive_frame(frame_a)["bases"]
-            rx_diya_bases = sim_alice.receive_frame(frame_b)["bases"]
+            rx_aarav_payload = sim_bob.receive_frame(frame_a, "basis_exchange")
+            rx_diya_payload = sim_alice.receive_frame(frame_b, "basis_exchange")
+
+            rx_aarav_bases = rx_aarav_payload.get("bases")
+            rx_diya_bases = rx_diya_payload.get("bases")
+
+            if not isinstance(rx_aarav_bases, list) or len(rx_aarav_bases) != batch_size or any(b not in ('+', 'x') for b in rx_aarav_bases):
+                raise AuthenticationError("Invalid bases payload")
+            if not isinstance(rx_diya_bases, list) or len(rx_diya_bases) != batch_size or any(b not in ('+', 'x') for b in rx_diya_bases):
+                raise AuthenticationError("Invalid bases payload")
         except Exception as e:
             return {
                 "secure": False,
@@ -830,21 +857,26 @@ def run_secure_bb84(
             "sample_bits": diya_sample_bits
         })
 
-        rx_aarav_pe = sim_bob.receive_frame(frame_a_pe)
-        rx_diya_pe = sim_alice.receive_frame(frame_b_pe)
+        rx_aarav_pe = sim_bob.receive_frame(frame_a_pe, "parameter_estimation")
+        rx_diya_pe = sim_alice.receive_frame(frame_b_pe, "parameter_estimation")
+
+        if not isinstance(rx_aarav_pe.get("sample_indices"), list) or not isinstance(rx_diya_pe.get("sample_indices"), list):
+            raise AuthenticationError("Invalid sample indices format")
 
         # Verify both endpoints received the exactly agreed-upon sample indices
         if rx_aarav_pe["sample_indices"] != sample_indices or rx_diya_pe["sample_indices"] != sample_indices:
-            raise ValueError("Mismatched sample indices received")
+            raise AuthenticationError("Mismatched sample indices received")
 
-        rx_aarav_bits = rx_aarav_pe["sample_bits"]
-        rx_diya_bits = rx_diya_pe["sample_bits"]
+        rx_aarav_bits = rx_aarav_pe.get("sample_bits")
+        rx_diya_bits = rx_diya_pe.get("sample_bits")
 
+        if not isinstance(rx_aarav_bits, list) or not isinstance(rx_diya_bits, list):
+            raise AuthenticationError("Invalid sample bits format")
         # Verify payload shapes and bit domains
         if len(rx_aarav_bits) != sample_size or len(rx_diya_bits) != sample_size:
-            raise ValueError("Mismatched sample bits length")
-        if any(b not in (0, 1) for b in rx_aarav_bits) or any(b not in (0, 1) for b in rx_diya_bits):
-            raise ValueError("Malformed sample bits")
+            raise AuthenticationError("Mismatched sample bits length")
+        if any(type(b) is not int or b not in (0, 1) for b in rx_aarav_bits) or any(type(b) is not int or b not in (0, 1) for b in rx_diya_bits):
+            raise AuthenticationError("Malformed sample bits")
 
     except Exception as e:
         return {
@@ -1022,16 +1054,14 @@ def run_secure_bb84(
         if sim_alice is not None and sim_bob is not None:
             # 1. First PA Seed Exchange
             frame_a_seed1 = sim_alice.send_frame("toeplitz_seed", {"seed": toeplitz_seed_1_aarav})
-            rx_diya_seed1 = sim_bob.receive_frame(frame_a_seed1)
-            toeplitz_seed_1_diya = rx_diya_seed1["seed"]
+            rx_diya_seed1 = sim_bob.receive_frame(frame_a_seed1, "toeplitz_seed")
+            toeplitz_seed_1_diya = rx_diya_seed1.get("seed")
 
-            if not isinstance(toeplitz_seed_1_diya, list) or len(toeplitz_seed_1_diya) != seed_length_1 or not all(b in (0, 1) for b in toeplitz_seed_1_diya):
+            if not isinstance(toeplitz_seed_1_diya, list) or len(toeplitz_seed_1_diya) != seed_length_1 or any(type(b) is not int or b not in (0, 1) for b in toeplitz_seed_1_diya):
                 raise AuthenticationError("Invalid Toeplitz seed format received.")
 
             frame_b_ack1 = sim_bob.send_frame("toeplitz_seed_ack", {"status": "ok"})
-            if frame_b_ack1.get("msg_type") != "toeplitz_seed_ack":
-                raise AuthenticationError("Invalid acknowledgment message type.")
-            rx_ack1_payload = sim_alice.receive_frame(frame_b_ack1)
+            rx_ack1_payload = sim_alice.receive_frame(frame_b_ack1, "toeplitz_seed_ack")
             if rx_ack1_payload.get("status") != "ok":
                 raise AuthenticationError("Invalid acknowledgment status.")
 
@@ -1045,19 +1075,21 @@ def run_secure_bb84(
             conf_tag_aarav = toeplitz_hash(pa1_out_aarav, tag_bits, conf_seed_aarav)
 
             frame_a_conf = sim_alice.send_frame("key_confirmation", {"seed": conf_seed_aarav, "tag": conf_tag_aarav})
-            rx_b_conf = sim_bob.receive_frame(frame_a_conf)
+            rx_b_conf = sim_bob.receive_frame(frame_a_conf, "key_confirmation")
 
-            conf_seed_diya = rx_b_conf["seed"]
-            received_tag = rx_b_conf["tag"]
+            conf_seed_diya = rx_b_conf.get("seed")
+            received_tag = rx_b_conf.get("tag")
+            if not isinstance(conf_seed_diya, list) or len(conf_seed_diya) != conf_seed_len or any(type(b) is not int or b not in (0, 1) for b in conf_seed_diya):
+                raise AuthenticationError("Invalid conf_seed format")
+            if not isinstance(received_tag, list) or len(received_tag) != tag_bits or any(type(b) is not int or b not in (0, 1) for b in received_tag):
+                raise AuthenticationError("Invalid received_tag format")
 
             conf_tag_diya = toeplitz_hash(pa1_out_diya, tag_bits, conf_seed_diya)
             match_status = "match" if conf_tag_diya == received_tag else "mismatch"
 
             frame_b_conf_ack = sim_bob.send_frame("key_confirmation_ack", {"status": match_status})
 
-            if frame_b_conf_ack.get("msg_type") != "key_confirmation_ack":
-                raise AuthenticationError("Invalid confirmation ack type.")
-            rx_ack2_payload = sim_alice.receive_frame(frame_b_conf_ack)
+            rx_ack2_payload = sim_alice.receive_frame(frame_b_conf_ack, "key_confirmation_ack")
 
             if rx_ack2_payload.get("status") not in ("match", "mismatch"):
                 raise AuthenticationError("Invalid confirmation ack status.")
@@ -1086,16 +1118,14 @@ def run_secure_bb84(
             toeplitz_seed_2_aarav = [rng.randint(0, 1) for _ in range(seed_length_2)]
 
             frame_a_seed2 = sim_alice.send_frame("toeplitz_seed2", {"seed": toeplitz_seed_2_aarav})
-            rx_diya_seed2 = sim_bob.receive_frame(frame_a_seed2)
-            toeplitz_seed_2_diya = rx_diya_seed2["seed"]
+            rx_diya_seed2 = sim_bob.receive_frame(frame_a_seed2, "toeplitz_seed2")
+            toeplitz_seed_2_diya = rx_diya_seed2.get("seed")
 
-            if not isinstance(toeplitz_seed_2_diya, list) or len(toeplitz_seed_2_diya) != seed_length_2 or not all(b in (0, 1) for b in toeplitz_seed_2_diya):
+            if not isinstance(toeplitz_seed_2_diya, list) or len(toeplitz_seed_2_diya) != seed_length_2 or any(type(b) is not int or b not in (0, 1) for b in toeplitz_seed_2_diya):
                 raise AuthenticationError("Invalid second Toeplitz seed format.")
 
             frame_b_ack2 = sim_bob.send_frame("toeplitz_seed2_ack", {"status": "ok"})
-            if frame_b_ack2.get("msg_type") != "toeplitz_seed2_ack":
-                raise AuthenticationError("Invalid second ack message type.")
-            rx_ack3_payload = sim_alice.receive_frame(frame_b_ack2)
+            rx_ack3_payload = sim_alice.receive_frame(frame_b_ack2, "toeplitz_seed2_ack")
             if rx_ack3_payload.get("status") != "ok":
                 raise AuthenticationError("Invalid second ack status.")
 

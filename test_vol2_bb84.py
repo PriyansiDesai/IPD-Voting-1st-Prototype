@@ -186,7 +186,7 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertTrue(res["reconciliation_success"])
         self.assertGreaterEqual(res["finite_key_bound"]["ell"], 256)
 
-    def test_low_noise_successful_reconciliation(self):
+    def test_low_noise_reconciliation_succeeds_but_finite_key_bound_aborts(self):
         """1.5% noise is fully corrected by 3-pass Cascade with revisits."""
         res = run_secure_bb84(
             min_key_length=256,
@@ -678,11 +678,11 @@ class TestVol2BB84SiftingAuthentication(unittest.TestCase):
 
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
+        def mock_receive(self_obj, frame, expected_msg_type):
             # Tamper with the frame payload
             if frame.get("msg_type") == "basis_exchange":
                 frame["payload"]["bases"] = ['+'] * len(frame["payload"]["bases"])
-            return original_receive(self_obj, frame)
+            return original_receive(self_obj, frame, expected_msg_type)
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
             res = run_secure_bb84(min_key_length=256, seed=42)
@@ -696,14 +696,14 @@ class TestVol2BB84SiftingAuthentication(unittest.TestCase):
 
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
+        def mock_receive(self_obj, frame, expected_msg_type):
             # Process the frame normally first
-            res = original_receive(self_obj, frame)
+            res = original_receive(self_obj, frame, expected_msg_type)
 
             # Immediately replay the exact same frame to the same endpoint.
             # This exercises the pad replay/sequence checks, not the sender check.
             # It will raise an AuthenticationError, which the caller catches to abort.
-            original_receive(self_obj, frame)
+            original_receive(self_obj, frame, expected_msg_type)
 
             return res
 
@@ -749,13 +749,13 @@ class TestVol2BB84ParameterEstimationAuthentication(unittest.TestCase):
 
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
+        def mock_receive(self_obj, frame, expected_msg_type):
             # Tamper with the frame payload if it's parameter estimation
             if frame.get("msg_type") == "parameter_estimation":
                 # Invert the first bit of the sample
                 if len(frame["payload"]["sample_bits"]) > 0:
                     frame["payload"]["sample_bits"][0] ^= 1
-            return original_receive(self_obj, frame)
+            return original_receive(self_obj, frame, expected_msg_type)
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
             res = run_secure_bb84(min_key_length=256, seed=42)
@@ -806,19 +806,107 @@ class TestVol2BB84ParameterEstimationAuthentication(unittest.TestCase):
             self.assertEqual(res["reason"], "authentication_failed")
             self.assertIsNone(res["final_key"])
 
+    def test_pe_validation_boolean_sample_bits(self):
+        """Boolean True/False in sample bits fails strict type validation and aborts."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "parameter_estimation" and self_obj.peer_id == "alice":
+                payload = dict(payload)
+                payload["sample_bits"] = list(payload["sample_bits"])
+                if len(payload["sample_bits"]) > 0:
+                    payload["sample_bits"][0] = True # Invalid boolean instead of exact int
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_unexpected_msg_type_aborts(self):
+        """Unexpected msg_type on a received frame immediately aborts."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_send = AuthenticatedChannelEndpoint.send_frame
+        original_receive = AuthenticatedChannelEndpoint.receive_frame
+
+        receive_called_with_wrong_type = False
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "parameter_estimation":
+                msg_type = "wrong_type"
+            return original_send(self_obj, msg_type, payload)
+
+        def mock_receive(self_obj, frame, expected_msg_type):
+            nonlocal receive_called_with_wrong_type
+            if frame.get("msg_type") == "wrong_type":
+                receive_called_with_wrong_type = True
+            return original_receive(self_obj, frame, expected_msg_type)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send), \
+             patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+            self.assertTrue(receive_called_with_wrong_type)
+
+    def test_toeplitz_seed_1_boolean_validation(self):
+        """Boolean True/False in Stage 1 Toeplitz seed fails strict type validation and aborts."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "toeplitz_seed" and self_obj.peer_id == "bob":
+                payload = dict(payload)
+                payload["seed"] = list(payload["seed"])
+                if len(payload["seed"]) > 0:
+                    payload["seed"][0] = False # Invalid boolean instead of exact int
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
+    def test_toeplitz_seed_2_boolean_validation(self):
+        """Boolean True/False in Stage 2 Toeplitz seed fails strict type validation and aborts."""
+        from voting.classical_channel import AuthenticatedChannelEndpoint
+
+        original_send = AuthenticatedChannelEndpoint.send_frame
+
+        def mock_send(self_obj, msg_type, payload):
+            if msg_type == "toeplitz_seed2" and self_obj.peer_id == "bob":
+                payload = dict(payload)
+                payload["seed"] = list(payload["seed"])
+                if len(payload["seed"]) > 0:
+                    payload["seed"][0] = True # Invalid boolean instead of exact int
+            return original_send(self_obj, msg_type, payload)
+
+        with patch.object(AuthenticatedChannelEndpoint, 'send_frame', new=mock_send):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "authentication_failed")
+            self.assertIsNone(res["final_key"])
+
     def test_pe_authentication_tamper_bob_to_alice_aborts(self):
         """Tampering specifically with Bob's PE frame causes an immediate abort."""
         from voting.classical_channel import AuthenticatedChannelEndpoint
 
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
+        def mock_receive(self_obj, frame, expected_msg_type):
             # self_obj.peer_id is the peer of the endpoint receiving the frame.
             # Alice receives from Bob, so self_obj.peer_id == "bob"
             if frame.get("msg_type") == "parameter_estimation" and self_obj.peer_id == "bob":
                 if len(frame["payload"]["sample_bits"]) > 0:
                     frame["payload"]["sample_bits"][0] ^= 1
-            return original_receive(self_obj, frame)
+            return original_receive(self_obj, frame, expected_msg_type)
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
             res = run_secure_bb84(min_key_length=256, seed=42)
@@ -833,13 +921,13 @@ class TestVol2BB84ParameterEstimationAuthentication(unittest.TestCase):
 
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
-            res = original_receive(self_obj, frame)
+        def mock_receive(self_obj, frame, expected_msg_type):
+            res = original_receive(self_obj, frame, expected_msg_type)
 
             if frame.get("msg_type") == "parameter_estimation":
                 # Immediately replay the exact same frame to the same endpoint.
                 # This exercises the pad replay/sequence checks.
-                original_receive(self_obj, frame)
+                original_receive(self_obj, frame, expected_msg_type)
 
             return res
 
@@ -859,11 +947,11 @@ class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
+        def mock_receive(self_obj, frame, expected_msg_type):
             if frame.get("msg_type") == "parity":
                 # Tamper with the payload without updating the MAC
                 frame["payload"]["p"] = 1 - frame["payload"]["p"]
-            return original_receive(self_obj, frame)
+            return original_receive(self_obj, frame, expected_msg_type)
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
             res = run_secure_bb84(min_key_length=256, seed=42)
@@ -877,11 +965,11 @@ class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
-            res = original_receive(self_obj, frame)
+        def mock_receive(self_obj, frame, expected_msg_type):
+            res = original_receive(self_obj, frame, expected_msg_type)
             if frame.get("msg_type") == "parity":
                 # Immediately replay the exact same frame to the same endpoint
-                original_receive(self_obj, frame)
+                original_receive(self_obj, frame, expected_msg_type)
             return res
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
@@ -913,11 +1001,11 @@ class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
+        def mock_receive(self_obj, frame, expected_msg_type):
             if frame.get("msg_type") == "bisection_parity":
                 # Tamper with the payload without updating the MAC
                 frame["payload"]["p"] = 1 - frame["payload"]["p"]
-            return original_receive(self_obj, frame)
+            return original_receive(self_obj, frame, expected_msg_type)
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
             # Use low channel error rate to ensure we successfully complete block parity but trigger a bisection
@@ -932,11 +1020,11 @@ class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
-            res = original_receive(self_obj, frame)
+        def mock_receive(self_obj, frame, expected_msg_type):
+            res = original_receive(self_obj, frame, expected_msg_type)
             if frame.get("msg_type") == "bisection_parity":
                 # Immediately replay the exact same frame to the same endpoint
-                original_receive(self_obj, frame)
+                original_receive(self_obj, frame, expected_msg_type)
             return res
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
@@ -968,14 +1056,14 @@ class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
+        def mock_receive(self_obj, frame, expected_msg_type):
             if frame.get("msg_type") == "verification_tag":
                 # Tamper with the payload tag (invert first hex character)
                 tag_hex = frame["payload"]["tag"]
                 char = tag_hex[0]
                 new_char = '0' if char != '0' else '1'
                 frame["payload"]["tag"] = new_char + tag_hex[1:]
-            return original_receive(self_obj, frame)
+            return original_receive(self_obj, frame, expected_msg_type)
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
             # Zero channel error avoids bisection, but initial block-parity exchanges still occur before the tag exchange
@@ -990,11 +1078,11 @@ class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
         from voting.classical_channel import AuthenticatedChannelEndpoint
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
-            res = original_receive(self_obj, frame)
+        def mock_receive(self_obj, frame, expected_msg_type):
+            res = original_receive(self_obj, frame, expected_msg_type)
             if frame.get("msg_type") == "verification_tag":
                 # Immediately replay the exact same frame to the same endpoint
-                original_receive(self_obj, frame)
+                original_receive(self_obj, frame, expected_msg_type)
             return res
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
@@ -1076,8 +1164,8 @@ class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
             return original_send(self_obj, msg_type, payload)
 
         original_receive = AuthenticatedChannelEndpoint.receive_frame
-        def mock_receive(self_obj, frame):
-            res = original_receive(self_obj, frame)
+        def mock_receive(self_obj, frame, expected_msg_type):
+            res = original_receive(self_obj, frame, expected_msg_type)
             if frame.get("msg_type") == "toeplitz_seed":
                 captured_seed["bob"] = res["seed"]
             return res
@@ -1097,12 +1185,12 @@ class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
         from vol2_bb84 import run_secure_bb84
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
+        def mock_receive(self_obj, frame, expected_msg_type):
             if frame.get("msg_type") == "toeplitz_seed":
                 # Invert first bit
                 seed = frame["payload"]["seed"]
                 frame["payload"]["seed"] = [1 - seed[0]] + seed[1:]
-            return original_receive(self_obj, frame)
+            return original_receive(self_obj, frame, expected_msg_type)
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
             res = run_secure_bb84(min_key_length=256, channel_error_rate=0.0, seed=42)
@@ -1117,10 +1205,10 @@ class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
         from vol2_bb84 import run_secure_bb84
         original_receive = AuthenticatedChannelEndpoint.receive_frame
 
-        def mock_receive(self_obj, frame):
-            res = original_receive(self_obj, frame)
+        def mock_receive(self_obj, frame, expected_msg_type):
+            res = original_receive(self_obj, frame, expected_msg_type)
             if frame.get("msg_type") == "toeplitz_seed":
-                original_receive(self_obj, frame)
+                original_receive(self_obj, frame, expected_msg_type)
             return res
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
@@ -1241,10 +1329,10 @@ class TestVol2BB84KeyConfirmationAuthentication(unittest.TestCase):
         from vol2_bb84 import run_secure_bb84
 
         original_receive = AuthenticatedChannelEndpoint.receive_frame
-        def mock_receive(self_obj, frame):
-            res = original_receive(self_obj, frame)
+        def mock_receive(self_obj, frame, expected_msg_type):
+            res = original_receive(self_obj, frame, expected_msg_type)
             if frame.get("msg_type") == "key_confirmation":
-                original_receive(self_obj, frame) # Replay
+                original_receive(self_obj, frame, expected_msg_type) # Replay
             return res
 
         with patch.object(AuthenticatedChannelEndpoint, 'receive_frame', new=mock_receive):
