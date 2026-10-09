@@ -254,11 +254,21 @@ class TestVol2BB84Protocol(unittest.TestCase):
         """Mathematical worst-case frame budget remains within the 4,700 limit."""
         import math
         from voting.classical_channel import MAX_FRAMES
+        from vol2_bb84 import (
+            TARGET_SIFTED_BITS,
+            MAX_ROUNDS_LIMIT,
+            REC_NUM_PASSES,
+            REC_BLOCK_SIZE,
+            MAX_RECONCILIATION_REVISITS
+        )
 
-        max_sifted_bits = 3199
-        block_sizes = [32, 32, 48]
-        max_revisits = 50
-        max_rounds = 15
+        max_sifted_bits = TARGET_SIFTED_BITS - 1
+        block_sizes = [
+            REC_BLOCK_SIZE if pass_idx < 2 else int(REC_BLOCK_SIZE * 1.5)
+            for pass_idx in range(REC_NUM_PASSES)
+        ]
+        max_revisits = MAX_RECONCILIATION_REVISITS
+        max_rounds = MAX_ROUNDS_LIMIT
 
         # 1. Initial parity exchanges (1 pair per block)
         total_blocks = sum(math.ceil(max_sifted_bits / bs) for bs in block_sizes)

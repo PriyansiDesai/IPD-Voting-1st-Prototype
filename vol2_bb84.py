@@ -419,7 +419,7 @@ def reconcile_keys(
         blocks_by_pass.append(pass_blocks)
 
     revisit_queue = []
-    revisit_budget = 50
+    revisit_budget = MAX_RECONCILIATION_REVISITS
 
     def queue_revisits(err_idx: int, up_to_pass: int):
         for prev_p in range(up_to_pass):
@@ -513,6 +513,7 @@ def reconcile_keys(
 # This bound includes basis exchange, parameter estimation, reconciliation,
 # PA seeds, and confirmation tags exchanged over the simulated authenticated
 # channel.
+MAX_RECONCILIATION_REVISITS = 50
 TARGET_SIFTED_BITS = 3200
 MAX_BATCH_SIZE = 4000
 MAX_ROUNDS_LIMIT = 15
