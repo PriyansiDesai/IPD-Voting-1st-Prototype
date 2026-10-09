@@ -199,6 +199,26 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertEqual(res["reason"], "finite_key_bound_insufficient")
         self.assertIsNone(res["final_key"])
 
+    def test_very_low_noise_reconciliation_succeeds(self):
+        """A deterministic test showing that a low but nonzero channel_error_rate can produce a usable key."""
+        res = run_secure_bb84(
+            min_key_length=256,
+            channel_error_rate=0.005,
+            seed=42
+        )
+        self.assertTrue(res.get("secure", False))
+        self.assertFalse(res.get("aborted", True))
+        self.assertGreater(res["qber"], 0.0)
+        self.assertIsNotNone(res["final_key"])
+        self.assertEqual(len(res["final_key"]), 256)
+        self.assertEqual(res["final_key_length"], 256)
+
+        # finite-key bound check
+        self.assertIn("finite_key_bound", res)
+        bound = res["finite_key_bound"]
+        self.assertTrue(bound["valid"])
+        self.assertGreaterEqual(bound["ell"], 256)
+
     def test_unresolved_reconciliation_failure(self):
         """Noise just below QBER threshold (e.g. 10%) exhausts the revisit limit and fails tag verification."""
         res = run_secure_bb84(
