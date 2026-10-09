@@ -534,6 +534,30 @@ class TestVol2BB84Protocol(unittest.TestCase):
         self.assertEqual(len(res_default["final_key"]), 256)
 
 
+
+    def test_mismatched_reconciled_keys_fail_at_confirmation(self):
+        """Proves run_secure_bb84 does not abort at reconciliation if tags collide on mismatched keys,
+        but instead correctly fails at final key confirmation."""
+        from vol2_bb84 import run_secure_bb84
+        from unittest.mock import patch
+        import vol2_bb84
+
+        original_reconcile = vol2_bb84.reconcile_keys
+
+        def mock_reconcile(*args, **kwargs):
+            a_rec, b_rec, disclosed, success = original_reconcile(*args, **kwargs)
+            if len(b_rec) > 0:
+                b_rec[0] = 1 - b_rec[0]
+            return a_rec, b_rec, disclosed, True
+
+        with patch("vol2_bb84.reconcile_keys", new=mock_reconcile):
+            res = run_secure_bb84(min_key_length=256, seed=42)
+
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "privacy_amplification_mismatch")
+            self.assertIsNone(res["final_key"])
+
 class TestM2BB84AbortIntegration(unittest.TestCase):
     """Integration tests verifying M2 fail-closed behavior on BB84 abort or key defects.
 
@@ -1149,6 +1173,34 @@ class TestVol2BB84ReconciliationAuthentication(unittest.TestCase):
                 sim_alice=alice_ep,
                 sim_bob=bob_ep
             )
+
+    def test_reconciliation_relies_on_tags_not_raw_lists(self):
+        """Verifies reconciliation result is determined by exchanged tags, not direct raw-list equality."""
+        from vol2_bb84 import reconcile_keys
+        from voting.classical_channel import SynchronizedFrameAllocator, AuthenticatedChannelEndpoint
+        import os
+        from unittest.mock import patch
+
+        allocator = SynchronizedFrameAllocator(os.urandom(16 + 4700 * 16))
+        alice_ep = AuthenticatedChannelEndpoint("run1", "alice", "bob", allocator)
+        bob_ep = AuthenticatedChannelEndpoint("run1", "bob", "alice", allocator)
+
+        # Create bits with matching parity but completely different contents
+        # Parity of [1, 1, 1, 1] is 0. Parity of [0, 0, 0, 0] is 0.
+        # This bypasses bisection correction since parities match.
+        alice_bits = [1, 1, 1, 1]
+        bob_bits   = [0, 0, 0, 0]
+
+        with patch("vol2_bb84.hashlib.sha256") as mock_sha256:
+            # Force tags to match even though bits don't
+            mock_sha256.return_value.digest.return_value = b"fake_collision_tag_with_long_length"
+
+            alice_rec, bob_rec, disclosed, success = reconcile_keys(
+                alice_bits, bob_bits, num_passes=1, sim_alice=alice_ep, sim_bob=bob_ep
+            )
+
+            self.assertTrue(success)
+            self.assertNotEqual(alice_rec, bob_rec)
 
 class TestVol2BB84SeedExchangeAuthentication(unittest.TestCase):
     def test_seed_exchange_valid(self):

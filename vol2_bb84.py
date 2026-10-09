@@ -330,6 +330,7 @@ def reconcile_keys(
 
     Model Note: Initial block-parity exchanges, bisection queries, verification tags,
     and revisit parities/bisections are authenticated via the provided sim_alice/sim_bob endpoints.
+    The simulated protocol decision is driven solely by tag equality.
     Limitation: The verification tag is constructed via truncated SHA-256. While practically
     unforgeable (random oracle heuristic), a strict information-theoretic composable bound
     would require an eps-almost 2-universal hash family (e.g., polynomial evaluation over GF(2^t)).
@@ -520,7 +521,7 @@ def reconcile_keys(
             alice_tag = alice_tag_local
             bob_tag = bob_tag_local
 
-        if alice_tag == bob_tag and alice == bob:
+        if alice_tag == bob_tag:
             return alice, bob, disclosed_bits, True
 
     return alice, bob, disclosed_bits, False
@@ -984,7 +985,7 @@ def run_secure_bb84(
             "reason": "frame_budget_exceeded",
         }
 
-    if not rec_success or rec_aarav != rec_diya:
+    if not rec_success:
         return {
             "secure": False,
             "aborted": True,
