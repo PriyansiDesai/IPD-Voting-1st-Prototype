@@ -1675,3 +1675,84 @@ class TestVol2BB84AuthKeyInjection(unittest.TestCase):
             self.assertEqual(res["reason"], "invalid_auth_key_type")
             self.assertIsNone(res["final_key"])
             self.assertIn("eps_auth", res)
+
+    def test_pauli_channel_zero_noise(self):
+        """Zero channel noise must produce zero QBER."""
+        from vol2_bb84 import run_secure_bb84
+        res = run_secure_bb84(channel_error_rate=0.0, seed=123)
+        self.assertEqual(res["qber"], 0.0)
+        self.assertTrue(res["secure"])
+
+    def test_pauli_channel_nonzero_noise(self):
+        """Nonzero channel noise must affect measurements and produce a nonzero QBER."""
+        from vol2_bb84 import run_secure_bb84
+        res = run_secure_bb84(channel_error_rate=0.015, seed=123)
+        self.assertGreater(res["qber"], 0.0)
+        self.assertLess(res["qber"], 0.11) # Should still pass finite-key checks if low enough
+        self.assertTrue(res["secure"])
+
+    def test_eavesdropping_triggers_abort_with_channel_noise(self):
+        """Eavesdropping must still trigger the expected abort behavior even if channel noise is present."""
+        from vol2_bb84 import run_secure_bb84
+        res = run_secure_bb84(channel_error_rate=0.01, eavesdrop=True, seed=123)
+        self.assertTrue(res["aborted"])
+        self.assertFalse(res["secure"])
+        self.assertEqual(res["reason"], "qber_threshold_exceeded")
+
+    def test_channel_error_rate_boundaries(self):
+        """Test that channel_error_rate validates the 1.5 multiplier limit."""
+        from vol2_bb84 import run_secure_bb84
+
+        # Valid boundary (0.666 * 1.5 = 0.999 <= 1.0)
+        res_valid = run_secure_bb84(channel_error_rate=0.666, seed=123, max_rounds=1)
+        self.assertNotEqual(res_valid.get("reason"), "invalid_channel_error_rate")
+
+        # Invalid boundary (> 1.0)
+        res_invalid_high = run_secure_bb84(channel_error_rate=0.667, seed=123)
+        self.assertFalse(res_invalid_high["secure"])
+        self.assertTrue(res_invalid_high["aborted"])
+        self.assertEqual(res_invalid_high["reason"], "invalid_channel_error_rate")
+        self.assertIsNone(res_invalid_high["final_key"])
+
+        # Invalid boundary (< 0.0)
+        res_invalid_low = run_secure_bb84(channel_error_rate=-0.1, seed=123)
+        self.assertFalse(res_invalid_low["secure"])
+        self.assertTrue(res_invalid_low["aborted"])
+        self.assertEqual(res_invalid_low["reason"], "invalid_channel_error_rate")
+        self.assertIsNone(res_invalid_low["final_key"])
+
+    @patch('vol2_bb84.QuantumCircuit.y')
+    def test_pauli_noise_invoked_normal_run(self, mock_y):
+        """Verify that Pauli noise operations are invoked in a normal run."""
+        from vol2_bb84 import run_secure_bb84
+        run_secure_bb84(channel_error_rate=0.5, seed=123, max_rounds=1)
+        self.assertGreater(mock_y.call_count, 0)
+
+    @patch('vol2_bb84.QuantumCircuit.y')
+    def test_pauli_noise_invoked_eavesdrop_run(self, mock_y):
+        """Verify that Pauli noise operations are invoked in an eavesdrop run."""
+        from vol2_bb84 import run_secure_bb84
+        run_secure_bb84(channel_error_rate=0.5, eavesdrop=True, seed=123, max_rounds=1)
+        self.assertGreater(mock_y.call_count, 0)
+
+    def test_channel_error_rate_invalid_types(self):
+        """Test that channel_error_rate rejects invalid types without raising exceptions."""
+        from vol2_bb84 import run_secure_bb84
+
+        for invalid_val in ["0.1", None, True, False]:
+            res = run_secure_bb84(channel_error_rate=invalid_val, seed=123, max_rounds=1)
+            self.assertFalse(res["secure"])
+            self.assertTrue(res["aborted"])
+            self.assertEqual(res["reason"], "invalid_channel_error_rate")
+            self.assertIsNone(res["final_key"])
+
+    def test_channel_error_rate_exact_upper_boundary(self):
+        """Test that channel_error_rate exact valid upper boundary (2/3) is accepted."""
+        from vol2_bb84 import run_secure_bb84
+
+        # Exact upper boundary 2.0 / 3.0
+        res = run_secure_bb84(channel_error_rate=2.0 / 3.0, seed=123, max_rounds=1)
+        self.assertNotEqual(res.get("reason"), "invalid_channel_error_rate")
+
+if __name__ == '__main__':
+    unittest.main()

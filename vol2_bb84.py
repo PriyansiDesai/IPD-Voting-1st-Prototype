@@ -603,6 +603,27 @@ def run_secure_bb84(
     l_max = math.ceil(MAX_SERIALIZED_FRAME_BYTES / 16) + 1
     eps_auth = MAX_FRAMES * l_max * (2.0 ** -128)
 
+    is_valid_type = type(channel_error_rate) in (int, float) and not isinstance(channel_error_rate, bool)
+    if not is_valid_type or not (0.0 <= channel_error_rate and channel_error_rate * 1.5 <= 1.0):
+        return {
+            "secure": False,
+            "aborted": True,
+            "qber": 0.0,
+            "sample_size": 0,
+            "error_count": 0,
+            "qber_threshold": qber_threshold,
+            "sifted_key_length": 0,
+            "eps_auth": eps_auth,
+            "final_key": None,
+            "final_key_length": 0,
+            "eavesdrop": eavesdrop,
+            "sample_indices": [],
+            "remaining_indices": [],
+            "reconciliation_disclosed_bits": 0,
+            "keys_match": False,
+            "reason": "invalid_channel_error_rate",
+        }
+
     if auth_key is not None:
         if not isinstance(auth_key, bytes):
             return {
@@ -736,10 +757,6 @@ def run_secure_bb84(
                 for q in range(c_len):
                     idx = c_start + q
                     bit = aarav_bits[idx]
-                    # Optional channel bit-flip noise
-                    if channel_error_rate > 0.0 and rng.random() < channel_error_rate:
-                        bit ^= 1
-
                     if aarav_bases[idx] == '+':
                         if bit == 1:
                             qc.x(q)
@@ -747,6 +764,17 @@ def run_secure_bb84(
                         if bit == 1:
                             qc.x(q)
                         qc.h(q)
+
+                    # Optional channel Pauli noise
+                    # Scaled by 1.5 so that the effective QBER (2/3 of the Pauli errors) equals channel_error_rate
+                    if channel_error_rate > 0.0 and rng.random() < channel_error_rate * 1.5:
+                        pauli = rng.choice(['x', 'y', 'z'])
+                        if pauli == 'x':
+                            qc.x(q)
+                        elif pauli == 'y':
+                            qc.y(q)
+                        elif pauli == 'z':
+                            qc.z(q)
 
                     if diya_bases[idx] == 'x':
                         qc.h(q)
@@ -791,6 +819,17 @@ def run_secure_bb84(
                     # Eve re-prepares
                     if eve_bases[idx] == 'x':
                         qc.h(q)
+
+                    # Optional channel Pauli noise
+                    # Scaled by 1.5 so that the effective QBER (2/3 of the Pauli errors) equals channel_error_rate
+                    if channel_error_rate > 0.0 and rng.random() < channel_error_rate * 1.5:
+                        pauli = rng.choice(['x', 'y', 'z'])
+                        if pauli == 'x':
+                            qc.x(q)
+                        elif pauli == 'y':
+                            qc.y(q)
+                        elif pauli == 'z':
+                            qc.z(q)
 
                     # Diya measures
                     if diya_bases[idx] == 'x':
